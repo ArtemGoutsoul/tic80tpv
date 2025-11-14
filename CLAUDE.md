@@ -10,7 +10,7 @@ The project is currently in development (work in progress).
 
 ## File Structure
 
-- **test2.lua** - Main demo source file (work in progress):
+- **tpv.lua** - Main demo source file (work in progress):
   - Demo metadata in header comments
   - Global variables and demo state
   - TIC() function - the main demo loop called 60 times per second
@@ -29,12 +29,12 @@ The project is currently in development (work in progress).
 
 To run the demo:
 ```
-tic80 test2.lua
+tic80 tpv.lua
 ```
 
 Or load in TIC-80 console:
 ```
-load test2.lua
+load tpv.lua
 run
 ```
 
@@ -78,7 +78,7 @@ This is a **demoscene production** - an audiovisual artistic demo showcasing pro
 ## Development Notes
 
 - The `.tic` file is the compiled/binary format - the `.lua` file is the source
-- Main demo development happens in test2.lua
+- Main demo development happens in tpv.lua
 - The stubs file is for IDE support only - it's not loaded by TIC-80
 - Demo effects should be optimized to run at 60 FPS within TIC-80's constraints
 
@@ -94,7 +94,7 @@ This is a **demoscene production** - an audiovisual artistic demo showcasing pro
 
 ## TIC-80 API Reference
 
-Complete TIC-80 API documentation is available in `tic80wiki/` folder (cloned from the official GitHub wiki).
+Complete TIC-80 API documentation is available in `tic80wiki/` folder (local copy of the official TIC-80 wiki documentation).
 
 ### Platform Concepts
 

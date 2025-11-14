@@ -1,0 +1,265 @@
+-- title:   game title
+-- author:  game developer, email, etc.
+-- desc:    short description
+-- site:    website link
+-- license: MIT License (change this to your license of choice)
+-- version: 0.1
+-- script:  lua
+
+-- Constants
+local PYRAMID_SIZE = 25
+local GRID_SPACING = 28
+local PALETTE_RAM_BASE = 0x3FC0
+
+-- Logo sprite constants
+local LOGO_SPR = 256       -- starting sprite index (top-left corner of bank 0)
+local LOGO_W = 16        -- 128 pixels / 8 = 16 sprites wide
+local LOGO_H = 16        -- 128 pixels / 8 = 16 sprites tall
+local KEY = 0            -- transparent color in the logo
+
+-- Draw the logo centered on screen
+function DrawLogoOnTop()
+	local pixelWidth = LOGO_W * 8
+	local pixelHeight = LOGO_H * 8
+
+	-- Center on 240x136 screen
+	local x = (240 - 128) // 2
+	local y = (136 - 128) // 2
+
+	spr(256, x, y, 0, 1, 0, 0, 16, 16)
+end
+
+-- Draw a pyramid with four colored triangular faces
+function DrawPyramid(x, y, width, height, centerX, centerY, timeValue)
+	local baseColor = timeValue / 400 % 4 + 1
+	local apexX = width / 2 + centerX
+	local apexY = height / 2 + centerY
+
+	-- Front face
+	tri(x, y, apexX, apexY, x + width, y, baseColor + 1)
+	-- Right face
+	tri(x + width, y, apexX, apexY, x + width, y + height, baseColor + 2)
+	-- Left face
+	tri(x, y, apexX, apexY, x, y + height, baseColor + 3)
+	-- Back face
+	tri(x, y + height, apexX, apexY, x + width, y + height, baseColor + 4)
+end
+
+-- Store original palette colors
+local originalPalette = {}
+for i = 0, 15 do
+	local address = PALETTE_RAM_BASE + i * 3
+	originalPalette[i] = {peek(address), peek(address + 1), peek(address + 2)}
+end
+
+-- BDR callback - called for each scanline
+-- Creates an animated rainbow wave effect
+function BDR(scanline)
+	local currentTime = time()
+	-- Create a wave offset based on scanline and time
+	local wave = scanline / 15 + currentTime / 400
+
+	-- Apply color shift to palette colors (skip color 0 to keep lines black)
+	for i = 1, 15 do
+		local address = PALETTE_RAM_BASE + i * 3
+		local red, green, blue = originalPalette[i][1], originalPalette[i][2], originalPalette[i][3]
+
+		-- Use oscillating values that stay positive (0.5 to 1.5 range)
+		local redShift = 0.5 + math.cos(wave) * 0.5
+		local greenShift = 0.5 + math.sin(wave + currentTime / 250) * 0.5
+		local blueShift = 0.5 + math.cos(wave + currentTime / 300 + 2) * 0.5
+
+		-- Blend colors to create rainbow effect while staying bright
+		poke(address, math.min(255, red * redShift + 60 * math.abs(math.sin(wave))))
+		poke(address + 1, math.min(255, green * greenShift + 60 * math.abs(math.sin(wave + 2))))
+		poke(address + 2, math.min(255, blue * blueShift + 60 * math.abs(math.sin(wave + 4))))
+	end
+end
+
+-- Draw a grid of animated pyramids with connecting lines
+function DrawPyramidGrid()
+	for x = 0, 240, GRID_SPACING do
+		local previousX = x
+		local previousY = 0.0
+
+		for y = 0, 136, GRID_SPACING do
+			-- Calculate animated offset for pyramid apex
+			local offsetX = 12 * math.sin(time() / 10000 * (x + y + 1))
+			local offsetY = 12 * math.cos(time() / 10000 * (x + y + 1))
+
+			-- Draw pyramid
+			DrawPyramid(x, y, PYRAMID_SIZE, PYRAMID_SIZE, x + offsetX, y + offsetY, 1)
+
+			-- Calculate center point of pyramid
+			local centerX = x + PYRAMID_SIZE / 2 + offsetX
+			local centerY = y + PYRAMID_SIZE / 2 + offsetY
+
+			-- Draw connecting line between pyramids
+			line(previousX, previousY, centerX, centerY, 0)
+
+			previousX = centerX
+			previousY = centerY
+		end
+	end
+end
+
+cls()
+function TIC()
+	-- Draw pyramid grid effect
+	DrawPyramidGrid()
+
+	-- Draw logo on top (last = rendered on top)
+	DrawLogoOnTop()
+end
+
+-- <TILES>
+-- 001:eccccccccc888888caaaaaaaca888888cacccccccacc0ccccacc0ccccacc0ccc
+-- 002:ccccceee8888cceeaaaa0cee888a0ceeccca0ccc0cca0c0c0cca0c0c0cca0c0c
+-- 003:eccccccccc888888caaaaaaaca888888cacccccccacccccccacc0ccccacc0ccc
+-- 004:ccccceee8888cceeaaaa0cee888a0ceeccca0cccccca0c0c0cca0c0c0cca0c0c
+-- 017:cacccccccaaaaaaacaaacaaacaaaaccccaaaaaaac8888888cc000cccecccccec
+-- 018:ccca00ccaaaa0ccecaaa0ceeaaaa0ceeaaaa0cee8888ccee000cceeecccceeee
+-- 019:cacccccccaaaaaaacaaacaaacaaaaccccaaaaaaac8888888cc000cccecccccec
+-- 020:ccca00ccaaaa0ccecaaa0ceeaaaa0ceeaaaa0cee8888ccee000cceeecccceeee
+-- </TILES>
+
+-- <SPRITES>
+-- 048:000000020002ffff0000dfff00007fff00002fff00002ddd0000270000000000
+-- 049:277d7dd7fffffffffffffffffffffffffdddfffd7007fffd0002ffff0000dfff
+-- 050:dfd7dff7ffffff72fffffd2ddf72700dd200000f2000000f2000000f7000000f
+-- 051:07dd7ddfdffffddffffffffdffffd77ffff00000ffd00000ffd00000ffd00000
+-- 052:d7ddddfdffd7dffffff70dffffff07d7dfff70000fffd0000dffd2002dffd700
+-- 053:fdfffffffffffffffffffdfd7dff77f707ff7d7000ff7f2000dfdf2000df2d20
+-- 054:ffff727ffffddfffdd770dff00000dff00000fff00000fff00002fff00007fff
+-- 055:fd7007dfffdf2007fffff200f7dffd20d007ff70d007dfd2d000dff7d0077ffd
+-- 056:ddd20000ffff70007ffff2000fffdf7007ff7dd002ffd0d700fff27d00dffd0d
+-- 057:0000000000000000000000000000000000000000000000000000000070000022
+-- 058:000000000000000000000000000000000000000000000000000000000d227720
+-- 065:0000dfff00002fff00000dff000007ff000002ff000000df0000002f00000002
+-- 066:d000000dd000000df2000007fd000000fd000000ffd20000fffd77ddfffffffd
+-- 067:ffd00000fff20000ffff720ddfffffff2dffffff00dfffff770777fffd202000
+-- 068:2fff27002fff0d00dff70d00ffd2d200fdddd200ffdd2000d700000000000000
+-- 069:00df777000dfff7000ddfd70007fffd7000dffff00027dff0000000000000000
+-- 070:00007fff0000dfff0000dfff0002fffdd27fffd0ffdf70000000000000000000
+-- 071:dddfffff7dddddff000002ff0000002f00000007000000000000000000000000
+-- 072:007fffdfd02fffffd00dffffdd00dfdd7d700220000000000000000000000000
+-- 073:ddfd7277ffffffd2fffffffdfdf7220020000000000000000000000000000000
+-- 074:7dff720222277d72272000000000000000000000000000000000000000000000
+-- 075:7720000020000000000000000000000000000000000000000000000000000000
+-- 082:27fffd72000220000000000000000000000000000000000d0000000700000000
+-- 083:0000000000000000000000000000000000000000dddddd00dfffffd0df007ffd
+-- 091:00000000000000000000000000000000000000000007dd000000df000000df00
+-- 092:0000000000000000000000000000000000007dd000000ff00000000000000000
+-- 099:df0007dfdf0007dfdf007dfddfdddfd0dffffd00df000000df0000007f000000
+-- 100:00007dd7000ddfff007df00d00df700700dffddd00dfffff00dfd700000dfddd
+-- 101:000ddd07d007dfdffd00dffddf00dfd0df00df00ff00df000000df00d2007f00
+-- 102:ddd700ddffff0dff0000df700000dfd200000dff000000000000ddd200000dfd
+-- 103:dd000dddffd007dd07fd00df000000dfffd000df2dfd00df00df00dfddf200df
+-- 104:0ddd0000dfffd000d22dfd002002df000000df002002df00f72dfd00dfdff000
+-- 105:007ddd000ddfffd07df27ff7df7002dddffddddfdfffffffdfd700000dfdddd0
+-- 106:0000ddd7000ddfff00ddf00d00df000000df000000df000000dfd00d000dfddf
+-- 107:007ddfddd00dfffffd00df000000df000000df000000df00dd00df00d000dfff
+-- 108:d00dddd0f00dfff000000df000000df000000df000000df000000df0f00dddfd
+-- 109:07dd000007ff000002df000000df0000007f0002007f7007000ff72dd007fddf
+-- 110:dd00007ddf000ddfdf007df7df00df70dd00dffdfd00dffff000dfd720000dfd
+-- 111:dd000000ffd000002ffd000000df0000dddf0000ffff000000000000ddd00000
+-- 112:0000000000000000000000000000000000000000000000000000000000000020
+-- 113:00000000000000000000000000000002000000070000000d0000000d0000000d
+-- 114:00000000000000000000000000000000000000002000000072000000d7200000
+-- 115:7f00000000000000000000000000000000000000000000000000000000000000
+-- 116:0000dffd00000000000000000000000000000000000000000000000000000000
+-- 117:20007f0000000000000000000000000000000000000000000000000000000000
+-- 118:000000df00000000000000000000000000000000000000000000000000000000
+-- 119:fd2000df000000df000000df0000007f0000007f000000000000000000000000
+-- 120:0dfd00000000000000000000000000000000000000000000000000000000000d
+-- 121:00dffd000000000000000000000000000000000002000000dd000000fffdd000
+-- 122:0000dffd00000000000000000000000000000000000000000000000000000000
+-- 123:00000dff0000000000000000000000000000000000000000000000007d0000fd
+-- 124:d00dffff00000000000000000000000000000000000000000000000070000000
+-- 125:f0002ff200000000000000000000000000000000000000000000000000000000
+-- 126:0000007f00000000000000000000000000000000000000000000000000000000
+-- 127:fd00000000000000000000000000000000000000000000000000000002200000
+-- 128:0000007000000270000007d000002fd00007dfd2002ffdd702ffdfd72ffffdf7
+-- 129:0000000700000002000000020000000000000000000000000000000000000000
+-- 130:fd720000f7d72000fdffd720fddffdfdffdfdfdffdfddddddfddfdd2dffddfd0
+-- 131:000000000000000000000000d2000000d000007d00000dff0000ffff000dffff
+-- 132:00000000000000000000000000000000dfffffd7fffffdfdffffffff72d7ffff
+-- 133:0000000000000000000000000000000020000000f700007fdfd0007fffdd002d
+-- 134:0000000000000000000007dd007fffffdffffffffffffdfdfddfddddfffdf772
+-- 135:0000000000000000fffdd700ffffdfd7fffffdfdfdddfffd7227dffd00007dff
+-- 136:000027dd277dfff7007dfdfd000277ff70000022d7000000d7000000fd000000
+-- 137:fddfffffdddddffff7d7277ddfdfdf777dfdfdff00000ddf000007ff000007df
+-- 138:fd77727dfffffffdfffffd7d227707fdfddfdfdffffdd720ffd00000ffd00000
+-- 139:df0002ffdd0007fff70007ffd0000dff00000dff00000dff00000fff00000fff
+-- 140:fffd7000ffffffffdffffffffddfffdfdd72ddfdfd722200dd000000fd720000
+-- 141:00202000dfffd002fffd000ddfd700dffdf002ff7d200dff000007df00000000
+-- 142:0000000000000000d7000000ffd00000fddd0000fffdd000ffffd700dffffd7d
+-- 143:00df000000dffd0002ffffd007fffdf70fffffd77ffffdd0ffffdf00fffffd00
+-- 144:2dffffd700fffdfd00dffffd002fffdf000ffffd0007ffff0000ffff0000dfff
+-- 145:0000000000000000000000000000000070000000d0000007d0000007f200000d
+-- 146:dffddf70dfffdd20fffddf20ffffd700fffdd200fffd7000ffdf2000ffdf2000
+-- 147:000ffff7007fffd700dfff7d00ffff7f00ffffdd00dfffdf007ffffd000fffff
+-- 148:7fdfdfffd70007df7000000d00000000000000000000000000000000d0000000
+-- 149:ffdf7007fffdd000ffffd700dfffdd000ffdfd000ffffd000fffdf00dfffdd00
+-- 150:dfffd700dffdfd007fffdd070dffffff0dffffff00ffffff00dffdfd007ffdd7
+-- 151:0000dffd027dffffddfffdfdffffffddfdfddd70ffdffdd7ffffdd777dfffffd
+-- 152:dd000000d7000000d00000000000000000000000000000000000000077000000
+-- 153:000002ff000000df000000ff000000ff000000ff000002ff000002ff000007ff
+-- 154:ff700000fdd00000ffd00000fdf00000ffd00000fdf00000ffd00000d7d00000
+-- 155:00000fff00000fff00007fff0000dfff0000fffd0000ffff0007fffd000dffdf
+-- 156:fdd7dd72ffffdfdfdffffdfddddfdfdff0007dd7d0000027d000000070000000
+-- 157:70000000f0000000700000000000000000000000000000000000000000000000
+-- 158:0dffffdf00dfffff000dffff0000ffff0000ffff000dffff002fffff00dfffdf
+-- 159:fffdd000ffdf2000fff70000dfd20000fdd00000dfdd0000fffd7000dffdd000
+-- 160:0000dfff00000fff00000dff000007ff000000df000000df0000000f0000000d
+-- 161:dd00000dff00000dfd70000ffdd0000ffff0007fffd2007ffffd00dfffdf007f
+-- 162:fffd0000ffd70000fff20000ffd20000fdf20000ffd20000fd700000fd700000
+-- 163:000dffff0000ffff00007fff000007ff0000000d000000000000000000000000
+-- 164:ffd700dfffffffffffffffffffffffffdfdddfdd27fdfdff0072777700000000
+-- 165:fffddf00fffffd00fddfd200dfdfd000fdfd0000f7d000007700000000000000
+-- 166:007ffffd000fffdd002ffffd007fffff00dffffd00dfffff00ddffff07fdffff
+-- 167:002dfffd00007dffd00002dfd000002df7000002fd200000df200000ddd00000
+-- 168:fd720000dfdd7700fddfdf72fffdfdfd7fffffdd0dfffffd027fdfdf0027fdf7
+-- 169:00000dff00000fff00002fff70007fffd7772fd2ffd20000d000000000000000
+-- 170:fdd00000dfd00000dd700000fdd0000007d20000000000000000000000000000
+-- 171:000ffffd00dfffdf00ffffdf07fffffd0dfffff707ddffff00007ddf00000002
+-- 172:7000000070000000d7772002ffddd7d77dffffdffd72ddfdffffd727dffffffd
+-- 173:000000000000000000000000ddd70000dff200077d70000ddd00007ff70000df
+-- 174:02fffffd0dfffdd02fffffd0dfffdd00fffff700fffdd000ffff2000ffdd0000
+-- 175:fffff7000dffdd2000dfff70000ffdd20002ffd20000dffd00000fd0000007f7
+-- 176:0000000200000000000000000000000000000000000000000000000000000000
+-- 177:ffffd7ffdffffdff7fffdfff0ffffffd02fffffd00dfffdd007ffdfd000fdfdf
+-- 178:dd700000fd000000dd000000fd000000dd000000f2000000d0000000d0000000
+-- 182:00007ffd00000027000000000000000000000000000000000000000000000000
+-- 183:ffd20000ddd200007fd2000002770000007d0000000200000000000000000000
+-- 184:0000d70000007000000000000000000000000000000000000000000000000000
+-- 188:007fdfdd0002ddff00002fd7000002d700000022000000000000000000000000
+-- 189:d00007ff70000dff2000dfff0000dfff0007ffff000fffff007ffffd02ffffdd
+-- 190:fff20000fdd00000ff700000fd000000d7000000f2000000d200000070000000
+-- 191:000002f700000020000000000000000000000000000000000000000000000000
+-- 193:0007fffd0000dfdf0000dfdf00007ffd00000fd7000007d200000d7000000d70
+-- 194:7000000070000000200000000000000000000000000000000000000000000000
+-- 205:00fffffd007ffddd000ddffd0007fdf70002dfd20000df7000007d7000002d20
+-- 206:2000000000000000000000000000000000000000000000000000000000000000
+-- 209:0000070000000200000000000000000000000000000000000000000000000000
+-- 221:0000072000000700000007000000000000000000000000000000000000000000
+-- </SPRITES>
+
+-- <WAVES>
+-- 000:00000000ffffffff00000000ffffffff
+-- 001:0123456789abcdeffedcba9876543210
+-- 002:0123456789abcdef0123456789abcdef
+-- </WAVES>
+
+-- <SFX>
+-- 000:000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000304000000000
+-- </SFX>
+
+-- <TRACKS>
+-- 000:100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+-- </TRACKS>
+
+-- <PALETTE>
+-- 000:140c1c44243430346d4e4a4e854c30346524d04648757161597dced27d2c8595a16daa2cd2aa996dc2cadad45ededed6
+-- </PALETTE>
+
