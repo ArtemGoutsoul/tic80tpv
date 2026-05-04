@@ -10,6 +10,11 @@
 local GRID_SPACING = 28
 local PYRAMID_SIZE = GRID_SPACING  -- pyramids tile flush, no black gaps
 
+-- Wave parameters for grid-corner displacement (also reused by the logo
+-- shadow's height field, hence declared up here before any function uses it)
+local WAVE_AMP = 7           -- pixels of corner displacement (peak)
+local WAVE_SPEED = 0.0042    -- radians per ms (faster motion)
+
 -- Logo sprite constants
 local LOGO_SPR = 256       -- starting sprite index (top-left corner of bank 0)
 local LOGO_W = 16        -- 128 pixels / 8 = 16 sprites wide
@@ -134,32 +139,179 @@ function DrawLogoOnTop()
 	spr(256, x, y, 0, 1, 0, 0, 16, 16)
 end
 
--- Draw a pyramid with four dithered-gradient triangular faces.
--- Each face shades from its base ramp color at the two base corners (b=0)
--- to white at the apex (b=1), giving a spotlight-on-the-tip look.
-function DrawPyramid(x, y, width, height, centerX, centerY)
-	local apexX = width / 2 + centerX
-	local apexY = height / 2 + centerY
+-- Per-palette-index "one shade darker" lookup, used by the logo drop shadow.
+-- Hand-tuned for the DB16 palette: warm colors fall toward brown, cool colors
+-- fall toward blue/dark, and already-dark indices saturate at 0.
+local SHADOW_DARKEN = {
+	[0]  = 0,  [1]  = 0, [2]  = 0, [3]  = 1,
+	[4]  = 1,  [5]  = 1, [6]  = 4, [7]  = 1,
+	[8]  = 2,  [9]  = 4, [10] = 3, [11] = 5,
+	[12] = 7,  [13] = 8, [14] = 9, [15] = 10,
+}
 
-	-- Front face
-	DitheredTri(x, y, apexX, apexY, x + width, y, PYRAMID_FACE_RAMPS[1], 0, 1, 0)
-	-- Right face
-	DitheredTri(x + width, y, apexX, apexY, x + width, y + height, PYRAMID_FACE_RAMPS[2], 0, 1, 0)
-	-- Left face
-	DitheredTri(x, y, apexX, apexY, x, y + height, PYRAMID_FACE_RAMPS[3], 0, 1, 0)
-	-- Back face
-	DitheredTri(x, y + height, apexX, apexY, x + width, y + height, PYRAMID_FACE_RAMPS[4], 0, 1, 0)
+local SHADOW_OFFSET_X = 4
+local SHADOW_OFFSET_Y = 4
+
+-- Draw a dithered drop shadow under the logo with fake 3D depth.
+--
+-- For each non-transparent logo pixel we sample a sine-wave "surface height"
+-- at the would-be shadow location and scale the shadow offset by (1 - h*k).
+-- A high surface point sits closer to the logo, so the shadow lands closer to
+-- the logo (small offset); a low surface point is further from the logo, so
+-- the shadow lands further away (big offset). The wavefield is keyed off the
+-- same WAVE_SPEED used by the grid, so the shadow drifts in sync with the
+-- bending pyramids and looks like it's projected onto a real surface.
+--
+-- Coverage is 100%, but each pixel randomly picks between one-step (75%) and
+-- two-step (25%) darkening for an animated dither texture. The mix is lighter
+-- than the previous 50/50 single/double scheme.
+function DrawLogoShadow()
+	local logoX = (240 - 128) // 2
+	local logoY = (136 - 128) // 2
+	local random = math.random
+	local cos = math.cos
+	local floor = math.floor
+	local t = time()
+	local heightT = t * WAVE_SPEED
+
+	for ly = 0, 127 do
+		local logoSy = logoY + ly
+		local spriteRow = ly // 8
+		local pixelRow = ly % 8
+		for lx = 0, 127 do
+			local spriteCol = lx // 8
+			local pixelCol = lx % 8
+			local spriteAddr = 0xC000 + (spriteRow * 16 + spriteCol) * 64
+			if peek4(spriteAddr + pixelRow * 8 + pixelCol) ~= KEY then
+				local logoSx = logoX + lx
+
+				-- Use the SAME wave function the grid uses for vertical corner
+				-- displacement (the dy formula in DrawPyramidGrid), evaluated
+				-- at this pixel's grid coordinates. The shadow's depth thus
+				-- oscillates in phase with the underlying surface — when the
+				-- pyramid grid bulges up here, the shadow tucks closer to the
+				-- logo; when it dips, the shadow stretches further away.
+				local sampleX = logoSx + SHADOW_OFFSET_X
+				local sampleY = logoSy + SHADOW_OFFSET_Y
+				local gxF = sampleX / GRID_SPACING
+				local gyF = sampleY / GRID_SPACING
+				local heightAt = (
+					cos(heightT * 1.1  + gxF * 0.7 + gyF * 0.4) * 0.6 +
+					cos(heightT * 0.83 + gxF * 0.4 + gyF * 0.8) * 0.4
+				)
+				local distFactor = 1 - heightAt * 0.4
+
+				-- Subpixel rendering via dithering: instead of snapping each
+				-- pixel to its nearest integer screen coord, randomly pick
+				-- floor or floor+1 with probability equal to the fractional
+				-- part. As the offset continuously crosses an integer (e.g.
+				-- 4.3 → 4.7), the proportion of pixels at the ceil grows
+				-- 30% → 70% smoothly, so the shadow's centroid slides
+				-- sub-pixel-smoothly across the screen even though every
+				-- individual pixel is still placed on the integer grid.
+				local shadowFx = logoSx + SHADOW_OFFSET_X * distFactor
+				local shadowFy = logoSy + SHADOW_OFFSET_Y * distFactor
+				local fx = floor(shadowFx)
+				local fy = floor(shadowFy)
+				local shadowSx = (random() < shadowFx - fx) and (fx + 1) or fx
+				local shadowSy = (random() < shadowFy - fy) and (fy + 1) or fy
+
+				if shadowSx >= 0 and shadowSx < 240 and shadowSy >= 0 and shadowSy < 136 then
+					local addr = shadowSy * 240 + shadowSx
+					local current = peek4(addr)
+					-- 50/50 double vs triple darken for a deep, saturated
+					-- shadow that still has random-dither texture
+					local twice = SHADOW_DARKEN[SHADOW_DARKEN[current]]
+					if random(0, 1) == 0 then
+						poke4(addr, SHADOW_DARKEN[twice])
+					else
+						poke4(addr, twice)
+					end
+				end
+			end
+		end
+	end
 end
 
--- Draw a grid of animated pyramids
-function DrawPyramidGrid()
-	for x = 0, 240, GRID_SPACING do
-		for y = 0, 136, GRID_SPACING do
-			-- Calculate animated offset for pyramid apex
-			local offsetX = 12 * math.sin(time() / 10000 * (x + y + 1))
-			local offsetY = 12 * math.cos(time() / 10000 * (x + y + 1))
+-- Draw a pyramid with four dithered-gradient triangular faces.
+-- Takes the four base corners (top-left, top-right, bottom-left, bottom-right)
+-- explicitly so the caller can warp them; apex is supplied directly. Each face
+-- shades from its ramp's dark color at the base corners (b=0) to white at the
+-- apex (b=1), giving a spotlight-on-the-tip look.
+function DrawPyramid(tlX, tlY, trX, trY, blX, blY, brX, brY, apexX, apexY)
+	-- Front face (top edge)
+	DitheredTri(tlX, tlY, apexX, apexY, trX, trY, PYRAMID_FACE_RAMPS[1], 0, 1, 0)
+	-- Right face (right edge)
+	DitheredTri(trX, trY, apexX, apexY, brX, brY, PYRAMID_FACE_RAMPS[2], 0, 1, 0)
+	-- Left face (left edge)
+	DitheredTri(tlX, tlY, apexX, apexY, blX, blY, PYRAMID_FACE_RAMPS[3], 0, 1, 0)
+	-- Back face (bottom edge)
+	DitheredTri(blX, blY, apexX, apexY, brX, brY, PYRAMID_FACE_RAMPS[4], 0, 1, 0)
+end
 
-			DrawPyramid(x, y, PYRAMID_SIZE, PYRAMID_SIZE, x + offsetX, y + offsetY)
+-- Draw a grid of pyramids whose shared corners ride a 2D wave that's the
+-- sum of two sine/cosine harmonics at different speeds and phases, giving
+-- an irregular, non-periodic-looking flow. Corner positions are precomputed
+-- once per frame so adjacent cells share endpoints exactly (gap-free), and
+-- snapped to integer pixels so the rasterizer doesn't produce sub-pixel
+-- seam artifacts at shared edges. Outermost ring of corners is anchored.
+function DrawPyramidGrid()
+	local t = time()
+	local waveT = t * WAVE_SPEED
+	local sin, cos, min, floor = math.sin, math.cos, math.min, math.floor
+
+	local cellCols = (240 // GRID_SPACING) + 1
+	local cellRows = (136 // GRID_SPACING) + 1
+
+	-- Precompute warped corner positions (integer-snapped)
+	local cornerX = {}
+	local cornerY = {}
+	for gy = 0, cellRows do
+		local rowX = {}
+		local rowY = {}
+		local y0 = gy * GRID_SPACING
+		local edgeY = min(gy, cellRows - gy)
+		for gx = 0, cellCols do
+			local x0 = gx * GRID_SPACING
+			local edgeX = min(gx, cellCols - gx)
+			local edgeWeight = min(edgeX, edgeY, 1)  -- 0 at outer ring, 1 inside
+
+			-- Two harmonics at incommensurate ratios (1.0 and 1.73) give a
+			-- wave that doesn't look periodic over short timescales.
+			local dx = WAVE_AMP * (
+				sin(waveT        + gx * 0.45 + gy * 0.6) * 0.6 +
+				sin(waveT * 1.73 + gx * 0.9  + gy * 0.3) * 0.4
+			) * edgeWeight
+			local dy = WAVE_AMP * (
+				cos(waveT * 1.1  + gx * 0.7  + gy * 0.4) * 0.6 +
+				cos(waveT * 0.83 + gx * 0.4  + gy * 0.8) * 0.4
+			) * edgeWeight
+
+			rowX[gx] = floor(x0 + dx + 0.5)
+			rowY[gx] = floor(y0 + dy + 0.5)
+		end
+		cornerX[gy] = rowX
+		cornerY[gy] = rowY
+	end
+
+	-- Draw each cell using its 4 warped corners + an oscillating apex
+	for gy = 0, cellRows - 1 do
+		local rowX0, rowX1 = cornerX[gy], cornerX[gy + 1]
+		local rowY0, rowY1 = cornerY[gy], cornerY[gy + 1]
+		for gx = 0, cellCols - 1 do
+			local tlX, tlY = rowX0[gx],     rowY0[gx]
+			local trX, trY = rowX0[gx + 1], rowY0[gx + 1]
+			local blX, blY = rowX1[gx],     rowY1[gx]
+			local brX, brY = rowX1[gx + 1], rowY1[gx + 1]
+
+			-- Apex oscillates around the cell's (warped) center, snapped too
+			local centerX = (tlX + trX + blX + brX) * 0.25
+			local centerY = (tlY + trY + blY + brY) * 0.25
+			local angSpeed = (gx * GRID_SPACING + gy * GRID_SPACING + 1) / 10000
+			local apexX = floor(centerX + 12 * sin(t * angSpeed) + 0.5)
+			local apexY = floor(centerY + 12 * cos(t * angSpeed) + 0.5)
+
+			DrawPyramid(tlX, tlY, trX, trY, blX, blY, brX, brY, apexX, apexY)
 		end
 	end
 end
@@ -168,6 +320,11 @@ cls()
 function TIC()
 	-- Draw pyramid grid effect
 	DrawPyramidGrid()
+
+	-- Dithered drop shadow goes underneath the logo (drawn after the grid so
+	-- it darkens the grid pixels, but before the logo so the logo covers it
+	-- where they overlap).
+	DrawLogoShadow()
 
 	-- Draw logo on top (last = rendered on top)
 	DrawLogoOnTop()
