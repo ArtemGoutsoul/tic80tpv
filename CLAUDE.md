@@ -27,9 +27,11 @@ The project is currently in development (work in progress).
 
 ## TIC-80 Development Commands
 
+The TIC-80 executable lives one directory up from this project: `C:\dev\tic80\tic80.exe` (it is **not** on PATH).
+
 To run the demo:
 ```
-tic80 tpv.lua
+C:\dev\tic80\tic80.exe tpv.lua
 ```
 
 Or load in TIC-80 console:
@@ -40,7 +42,15 @@ run
 
 To play the test music:
 ```
-tic80 october.tic
+C:\dev\tic80\tic80.exe october.tic
+```
+
+### Launching from an automated/non-interactive shell
+
+TIC-80 needs its own window. Invoking it directly with `&` from a background PowerShell task causes it to load the cart and exit immediately (no TTY). Use `Start-Process` so it launches detached:
+
+```powershell
+Start-Process -FilePath "C:\dev\tic80\tic80.exe" -ArgumentList "C:\dev\tic80\test2\tpv.lua" -WorkingDirectory "C:\dev\tic80\test2"
 ```
 
 ## TIC-80 Architecture

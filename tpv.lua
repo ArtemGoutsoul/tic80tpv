@@ -7,15 +7,120 @@
 -- script:  lua
 
 -- Constants
-local PYRAMID_SIZE = 25
 local GRID_SPACING = 28
-local PALETTE_RAM_BASE = 0x3FC0
+local PYRAMID_SIZE = GRID_SPACING  -- pyramids tile flush, no black gaps
 
 -- Logo sprite constants
 local LOGO_SPR = 256       -- starting sprite index (top-left corner of bank 0)
 local LOGO_W = 16        -- 128 pixels / 8 = 16 sprites wide
 local LOGO_H = 16        -- 128 pixels / 8 = 16 sprites tall
 local KEY = 0            -- transparent color in the logo
+
+-- Draw a triangle whose interior is a dithered gradient through a list of
+-- palette indices. Scanline rasterizer: vertices are sorted by Y, then for
+-- each scanline the left/right x and brightness are linearly interpolated
+-- along the triangle edges. Brightness then advances by a constant step
+-- across each scanline (one add per pixel) and is mapped to a color-list
+-- position; a fresh random threshold per pixel picks between the two
+-- adjacent stops, giving white-noise dither that animates every frame.
+function DitheredTri(x1, y1, x2, y2, x3, y3, colorList, b1, b2, b3)
+	local segments = #colorList - 1
+	if segments < 1 then return end
+
+	-- Sort vertices by Y ascending: v1 top, v2 middle, v3 bottom
+	if y1 > y2 then x1, y1, b1, x2, y2, b2 = x2, y2, b2, x1, y1, b1 end
+	if y2 > y3 then x2, y2, b2, x3, y3, b3 = x3, y3, b3, x2, y2, b2 end
+	if y1 > y2 then x1, y1, b1, x2, y2, b2 = x2, y2, b2, x1, y1, b1 end
+
+	local floor = math.floor
+	local yTop = floor(y1)
+	local yBot = floor(y3)
+	if yTop < 0 then yTop = 0 end
+	if yBot > 135 then yBot = 135 end
+
+	-- Per-Y slopes for x and brightness on each of the three edges
+	local dy13 = y3 - y1
+	local dy12 = y2 - y1
+	local dy23 = y3 - y2
+	local mx13 = (dy13 ~= 0) and (x3 - x1) / dy13 or 0
+	local mb13 = (dy13 ~= 0) and (b3 - b1) / dy13 or 0
+	local mx12 = (dy12 ~= 0) and (x2 - x1) / dy12 or 0
+	local mb12 = (dy12 ~= 0) and (b2 - b1) / dy12 or 0
+	local mx23 = (dy23 ~= 0) and (x3 - x2) / dy23 or 0
+	local mb23 = (dy23 ~= 0) and (b3 - b2) / dy23 or 0
+
+	for y = yTop, yBot do
+		local dy = y - y1
+		-- Long edge v1->v3 (covers full height)
+		local xa = x1 + mx13 * dy
+		local ba = b1 + mb13 * dy
+		-- Short edge: v1->v2 above the middle vertex, v2->v3 below
+		local xb, bb
+		if y < y2 then
+			xb = x1 + mx12 * dy
+			bb = b1 + mb12 * dy
+		else
+			local dy2 = y - y2
+			xb = x2 + mx23 * dy2
+			bb = b2 + mb23 * dy2
+		end
+
+		-- Order endpoints so xL <= xR (carry brightness with them)
+		local xL, xR, bL, bR
+		if xa <= xb then
+			xL, xR, bL, bR = xa, xb, ba, bb
+		else
+			xL, xR, bL, bR = xb, xa, bb, ba
+		end
+
+		local pxL = floor(xL)
+		local pxR = floor(xR)
+		local span = pxR - pxL
+		local brightStep = (span > 0) and (bR - bL) / span or 0
+		local brightness = bL
+
+		-- Clip to screen X; advance brightness past the clipped pixels
+		if pxL < 0 then
+			brightness = brightness - brightStep * pxL
+			pxL = 0
+		end
+		if pxR > 239 then pxR = 239 end
+
+		if pxL <= pxR then
+			local random = math.random
+			local rowBase = y * 240
+
+			for x = pxL, pxR do
+				local b = brightness
+				if b < 0 then b = 0
+				elseif b > 1 then b = 1 end
+
+				local position = b * segments
+				local segIdx = floor(position)
+				if segIdx >= segments then segIdx = segments - 1 end
+				local intensity = floor((position - segIdx) * 16 + 0.5)
+
+				if intensity > random(0, 15) then
+					poke4(rowBase + x, colorList[segIdx + 2])
+				else
+					poke4(rowBase + x, colorList[segIdx + 1])
+				end
+
+				brightness = brightness + brightStep
+			end
+		end
+	end
+end
+
+-- Color ramps for the four pyramid faces. Each ramp goes from the face's
+-- base color (dark, at the base corners) to white (at the apex), traversing
+-- intermediate palette entries so the dither produces a smooth shaded look.
+local PYRAMID_FACE_RAMPS = {
+	{2,  8, 13, 15},  -- front: dark blue -> light blue -> cyan -> white
+	{3, 10, 15},      -- right: dark gray -> light gray -> white
+	{4,  9, 14, 15},  -- left:  brown -> orange -> yellow -> white
+	{5, 11, 14, 15},  -- back:  green -> light green -> yellow -> white
+}
 
 -- Draw the logo centered on screen
 function DrawLogoOnTop()
@@ -29,76 +134,32 @@ function DrawLogoOnTop()
 	spr(256, x, y, 0, 1, 0, 0, 16, 16)
 end
 
--- Draw a pyramid with four colored triangular faces
-function DrawPyramid(x, y, width, height, centerX, centerY, timeValue)
-	local baseColor = timeValue / 400 % 4 + 1
+-- Draw a pyramid with four dithered-gradient triangular faces.
+-- Each face shades from its base ramp color at the two base corners (b=0)
+-- to white at the apex (b=1), giving a spotlight-on-the-tip look.
+function DrawPyramid(x, y, width, height, centerX, centerY)
 	local apexX = width / 2 + centerX
 	local apexY = height / 2 + centerY
 
 	-- Front face
-	tri(x, y, apexX, apexY, x + width, y, baseColor + 1)
+	DitheredTri(x, y, apexX, apexY, x + width, y, PYRAMID_FACE_RAMPS[1], 0, 1, 0)
 	-- Right face
-	tri(x + width, y, apexX, apexY, x + width, y + height, baseColor + 2)
+	DitheredTri(x + width, y, apexX, apexY, x + width, y + height, PYRAMID_FACE_RAMPS[2], 0, 1, 0)
 	-- Left face
-	tri(x, y, apexX, apexY, x, y + height, baseColor + 3)
+	DitheredTri(x, y, apexX, apexY, x, y + height, PYRAMID_FACE_RAMPS[3], 0, 1, 0)
 	-- Back face
-	tri(x, y + height, apexX, apexY, x + width, y + height, baseColor + 4)
+	DitheredTri(x, y + height, apexX, apexY, x + width, y + height, PYRAMID_FACE_RAMPS[4], 0, 1, 0)
 end
 
--- Store original palette colors
-local originalPalette = {}
-for i = 0, 15 do
-	local address = PALETTE_RAM_BASE + i * 3
-	originalPalette[i] = {peek(address), peek(address + 1), peek(address + 2)}
-end
-
--- BDR callback - called for each scanline
--- Creates an animated rainbow wave effect
-function BDR(scanline)
-	local currentTime = time()
-	-- Create a wave offset based on scanline and time
-	local wave = scanline / 15 + currentTime / 400
-
-	-- Apply color shift to palette colors (skip color 0 to keep lines black)
-	for i = 1, 15 do
-		local address = PALETTE_RAM_BASE + i * 3
-		local red, green, blue = originalPalette[i][1], originalPalette[i][2], originalPalette[i][3]
-
-		-- Use oscillating values that stay positive (0.5 to 1.5 range)
-		local redShift = 0.5 + math.cos(wave) * 0.5
-		local greenShift = 0.5 + math.sin(wave + currentTime / 250) * 0.5
-		local blueShift = 0.5 + math.cos(wave + currentTime / 300 + 2) * 0.5
-
-		-- Blend colors to create rainbow effect while staying bright
-		poke(address, math.min(255, red * redShift + 60 * math.abs(math.sin(wave))))
-		poke(address + 1, math.min(255, green * greenShift + 60 * math.abs(math.sin(wave + 2))))
-		poke(address + 2, math.min(255, blue * blueShift + 60 * math.abs(math.sin(wave + 4))))
-	end
-end
-
--- Draw a grid of animated pyramids with connecting lines
+-- Draw a grid of animated pyramids
 function DrawPyramidGrid()
 	for x = 0, 240, GRID_SPACING do
-		local previousX = x
-		local previousY = 0.0
-
 		for y = 0, 136, GRID_SPACING do
 			-- Calculate animated offset for pyramid apex
 			local offsetX = 12 * math.sin(time() / 10000 * (x + y + 1))
 			local offsetY = 12 * math.cos(time() / 10000 * (x + y + 1))
 
-			-- Draw pyramid
-			DrawPyramid(x, y, PYRAMID_SIZE, PYRAMID_SIZE, x + offsetX, y + offsetY, 1)
-
-			-- Calculate center point of pyramid
-			local centerX = x + PYRAMID_SIZE / 2 + offsetX
-			local centerY = y + PYRAMID_SIZE / 2 + offsetY
-
-			-- Draw connecting line between pyramids
-			line(previousX, previousY, centerX, centerY, 0)
-
-			previousX = centerX
-			previousY = centerY
+			DrawPyramid(x, y, PYRAMID_SIZE, PYRAMID_SIZE, x + offsetX, y + offsetY)
 		end
 	end
 end
