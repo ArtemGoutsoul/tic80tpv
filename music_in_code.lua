@@ -8,26 +8,41 @@
 -- mini-notation). The engine synthesizes everything by poking the sound
 -- registers at 0x0FF9C -- including the DRUMS, so we get breakbeats, not beeps.
 --
--- MINI-NOTATION (per lane, space-separated steps):
---   c4 c#4 c-4  a note (accidental '#', '-' = natural; octave 0..8)
---   .  or  ~    rest (silence)
---   -           hold (let the current note keep ringing)
---   =           note off (cut the note)
---   k s h       drum hits on a drum lane (kick / snare / hat)
---   [a b]       subdivide ONE step into 2 (or 3+) faster hits  <- jungle rolls
---   x*4         repeat x four times inside its step (same as [x x x x])
---
 -- 4 channels: BASS, LEAD, ARP, and DRUMS (all percussion multiplexed on one
--- channel, NES-style). To compose: edit LANES / INSTRUMENTS / DRUMS / PATTERN.
+-- channel, NES-style). To compose: edit LANES / INSTRUMENTS / DRUMS / PATTERN;
+-- the mini-notation is documented above the LANES table.
 -- The <PALETTE> section at the bottom is REQUIRED (no palette => all black).
 -- =============================================================================
 
 local floor, sin, abs = math.floor, math.sin, math.abs
+local poke, poke4, peek = poke, poke4, peek  -- localize hot register access
 local TAU = math.pi * 2
 
-local SOUND_BASE = 0xFF9C  -- 4 channels, 18 bytes each (see tic80-sound skill)
+local SOUND_BASE = 0xFF9C     -- base of the sound registers
+local CHANNEL_STRIDE = 18     -- bytes per channel in the register block
 local CHANNELS = 4
-local TRANSPOSE = 0        -- global shift in semitones
+local FREQ_MAX = 0xFFF        -- frequency register is 12-bit
+local TRANSPOSE = 0           -- global shift in semitones
+
+-- Waveform names (also the keys into WAVEFORMS).
+local WAVE_SQUARE = "square"
+local WAVE_PULSE = "pulse"
+local WAVE_SAW = "saw"
+local WAVE_TRIANGLE = "triangle"
+local WAVE_SINE = "sine"
+local WAVE_NOISE = "noise"
+
+-- Voice playback modes.
+local MODE_MELODIC = "melodic"
+local MODE_DRUM = "drum"
+
+-- Mini-notation tokens.
+local TOKEN_REST = "."
+local TOKEN_REST_ALT = "~"
+local TOKEN_HOLD = "-"
+local TOKEN_OFF = "="
+local TOKEN_GROUP_OPEN = "["
+local TOKEN_GROUP_CLOSE = "]"
 
 -- -----------------------------------------------------------------------------
 -- Note names -> Hz. The 12-bit frequency register value IS the pitch in Hz.
@@ -52,17 +67,17 @@ local function buildWave(shape)
 	for i = 0, 31 do
 		local phase = i / 32
 		local value
-		if shape == "square" then
+		if shape == WAVE_SQUARE then
 			value = (phase < 0.5) and 15 or 0
-		elseif shape == "pulse25" then
+		elseif shape == WAVE_PULSE then
 			value = (phase < 0.25) and 15 or 0
-		elseif shape == "saw" then
+		elseif shape == WAVE_SAW then
 			value = floor(phase * 15 + 0.5)
-		elseif shape == "triangle" then
+		elseif shape == WAVE_TRIANGLE then
 			value = floor((1 - abs(phase * 2 - 1)) * 15 + 0.5)
-		elseif shape == "sine" then
+		elseif shape == WAVE_SINE then
 			value = floor((sin(phase * TAU) * 0.5 + 0.5) * 15 + 0.5)
-		else -- noise
+		else -- WAVE_NOISE: an all-zero table plays as noise
 			value = 0
 		end
 		wave[i + 1] = value
@@ -71,12 +86,12 @@ local function buildWave(shape)
 end
 
 local WAVEFORMS = {
-	square = buildWave("square"),
-	pulse = buildWave("pulse25"),
-	saw = buildWave("saw"),
-	triangle = buildWave("triangle"),
-	sine = buildWave("sine"),
-	noise = buildWave("noise"),
+	[WAVE_SQUARE] = buildWave(WAVE_SQUARE),
+	[WAVE_PULSE] = buildWave(WAVE_PULSE),
+	[WAVE_SAW] = buildWave(WAVE_SAW),
+	[WAVE_TRIANGLE] = buildWave(WAVE_TRIANGLE),
+	[WAVE_SINE] = buildWave(WAVE_SINE),
+	[WAVE_NOISE] = buildWave(WAVE_NOISE),
 }
 
 -- -----------------------------------------------------------------------------
@@ -88,11 +103,20 @@ local function tokenize(str)
 	local tokens, buffer, depth = {}, "", 0
 	for i = 1, #str do
 		local ch = str:sub(i, i)
-		if ch == "[" then depth = depth + 1; buffer = buffer .. ch
-		elseif ch == "]" then depth = depth - 1; buffer = buffer .. ch
+		if ch == TOKEN_GROUP_OPEN then
+			depth = depth + 1
+			buffer = buffer .. ch
+		elseif ch == TOKEN_GROUP_CLOSE then
+			depth = depth - 1
+			buffer = buffer .. ch
 		elseif ch == " " and depth == 0 then
-			if #buffer > 0 then tokens[#tokens + 1] = buffer; buffer = "" end
-		else buffer = buffer .. ch end
+			if #buffer > 0 then
+				tokens[#tokens + 1] = buffer
+				buffer = ""
+			end
+		else
+			buffer = buffer .. ch
+		end
 	end
 	if #buffer > 0 then tokens[#tokens + 1] = buffer end
 	return tokens
@@ -101,7 +125,7 @@ end
 -- Expand one step token into its atoms (handles [a b] groups and x*n repeats).
 local function expandStep(token)
 	local raw
-	if token:sub(1, 1) == "[" then
+	if token:sub(1, 1) == TOKEN_GROUP_OPEN then
 		raw = tokenize(token:sub(2, #token - 1))
 	else
 		raw = { token }
@@ -118,6 +142,11 @@ local function expandStep(token)
 	return atoms
 end
 
+-- Is this atom a rest/hold, i.e. produces no trigger event?
+local function isSilentAtom(atom)
+	return atom == TOKEN_REST or atom == TOKEN_REST_ALT or atom == TOKEN_HOLD
+end
+
 -- Compile a lane string into {frame, atom} events over framesPerStep per step.
 local function compileLane(patternStr, framesPerStep)
 	local steps = tokenize(patternStr)
@@ -127,7 +156,7 @@ local function compileLane(patternStr, framesPerStep)
 		local atoms = expandStep(token)
 		local count = #atoms
 		for atomIndex, atom in ipairs(atoms) do
-			if atom ~= "." and atom ~= "~" and atom ~= "-" then
+			if not isSilentAtom(atom) then
 				local frame = floor(baseFrame
 					+ (atomIndex - 1) / count * framesPerStep + 0.5)
 				events[#events + 1] = { frame = frame, atom = atom }
@@ -138,25 +167,43 @@ local function compileLane(patternStr, framesPerStep)
 end
 
 -- -----------------------------------------------------------------------------
--- INSTRUMENTS (pitched) -- waveform + volume envelope + optional gate/vibrato.
--- gate = auto note-off after N frames (nil = ring until retriggered).
+-- INSTRUMENTS (pitched) -- waveform + volume envelope + optional effects:
+--   gate         auto note-off after N frames (nil = ring until retriggered)
+--   vibratoDepth/vibratoRate   sinusoidal pitch wobble
+--   reeseDetune  fake two detuned oscillators by alternating pitch each frame
+--                (jungle "reese" bass); value is the detune ratio, e.g. 0.02
+--   pwm/pwmRate/pwmDepth   rebuild the pulse waveform each frame with an
+--                LFO-swept duty cycle (the classic evolving chiptune lead)
 -- -----------------------------------------------------------------------------
 local INSTRUMENTS = {
-	bass = { wave = "saw", peak = 12, sustain = 10, attack = 1, decay = 6,
-		release = 8, gate = nil, vibratoDepth = 2, vibratoRate = 5 },
-	lead = { wave = "pulse", peak = 9, sustain = 5, attack = 2, decay = 8,
-		release = 10, gate = 14, vibratoDepth = 3, vibratoRate = 6 },
-	arp = { wave = "square", peak = 7, sustain = 0, attack = 1, decay = 4,
-		release = 3, gate = 4, vibratoDepth = 0, vibratoRate = 0 },
+	-- reese sub: detuned saw (jungle's gnarly bass). For a clean sub instead,
+	-- set wave = WAVE_TRIANGLE and reeseDetune = nil.
+	bass = {
+		wave = WAVE_SAW, peak = 11, sustain = 9, attack = 2, decay = 8,
+		release = 10, gate = nil, vibratoDepth = 0, vibratoRate = 0,
+		reeseDetune = 0.02
+	},
+	-- PWM lead: the duty cycle sweeps slowly for an evolving hollow-to-full tone
+	lead = {
+		wave = WAVE_PULSE, peak = 8, sustain = 5, attack = 3, decay = 10,
+		release = 12, gate = 16, vibratoDepth = 0, vibratoRate = 0,
+		pwm = true, pwmRate = 0.5, pwmDepth = 0.35
+	},
+	-- thin plucky pulse for the fast arp; short so notes stay distinct
+	arp = {
+		wave = WAVE_PULSE, peak = 6, sustain = 0, attack = 1, decay = 5,
+		release = 3, gate = 4, vibratoDepth = 0, vibratoRate = 0
+	},
 }
 
--- DRUMS (one-shots). Pitched (kick) has a downward pitch envelope; noise
--- (snare/hat) uses noiseFreq for its "colour". peak = volume, ampFrames = length.
+-- DRUMS (one-shots). Kick = pitched: triangle with a downward pitch envelope.
+-- Snare/hat = noise; noiseFreq sets the "colour", and an optional noiseFreqEnd
+-- sweeps it over the hit (bright -> dark = a natural "pshh" tail).
+-- peak = volume (0..15), ampFrames = length in frames.
 local DRUMS = {
-	k = { wave = "triangle", pitchStart = 200, pitchEnd = 48,
-		pitchFrames = 5, ampFrames = 9, peak = 14 },
-	s = { wave = "noise", noiseFreq = 1400, ampFrames = 8, peak = 11 },
-	h = { wave = "noise", noiseFreq = 2600, ampFrames = 3, peak = 6 },
+	k = { wave = WAVE_TRIANGLE, pitchStart = 240, pitchEnd = 55, pitchFrames = 7, ampFrames = 12, peak = 15 },
+	s = { wave = WAVE_NOISE, noiseFreq = 2200, noiseFreqEnd = 700, ampFrames = 8, peak = 12 },
+	h = { wave = WAVE_NOISE, noiseFreq = 3500, ampFrames = 2, peak = 5 },
 }
 
 -- -----------------------------------------------------------------------------
@@ -164,44 +211,75 @@ local DRUMS = {
 -- -----------------------------------------------------------------------------
 local PATTERN = { steps = 16, framesPerStep = 5 }
 
+-- Each lane = one channel (0..3) + one instrument, or drums=true for the drum
+-- lane. `pattern` is read left-to-right, one token per step (16 steps here).
+-- Tokens:
+--   a2  c#5  c-5   play a note: letter A..G, then '#' sharp / '-' natural
+--                  (or nothing), then octave 0..8.  a4 = 440 Hz.
+--   .   or  ~      rest -- silence / leave the channel alone this step
+--   -              hold -- let the note from a previous step keep ringing
+--   =              note off -- cut the ringing note
+--   k  s  h        drum hits: kick / snare / hat  (drums lane only)
+--   [a b]          subdivide ONE step into 2 (or 3+) faster hits -> rolls/flams
+--                  e.g. "[s s]" = a two-hit snare roll inside one 16th
+--   x*4            repeat a token 4x inside its step, same as "[x x x x]"
+-- Extra spaces are ignored, so pad columns however lines up best for you.
+-- All lanes share the 16-step grid; use [ ] and * for anything faster.
+-- Add  off = true  to a lane to mute it (handy for testing; off = 1 works too).
 local LANES = {
-	{ channel = 0, instrument = "bass",
-		pattern = "a2 .  .  .  .  .  e2 .  a2 .  .  .  g2 .  .  ." },
-	{ channel = 1, instrument = "lead",
-		pattern = ".  .  .  .  a4 .  .  .  .  .  c5 .  .  .  e5 =" },
-	{ channel = 2, instrument = "arp",
-		pattern = "a4 c5 e5 c5 a4 c5 e5 c5 a4 c5 e5 c5 a4 c5 e5 c5" },
-	{ channel = 3, drums = true,
-		pattern = "k  h  .  h  s  h  .  [h h] k  .  k  h  s  h  .  [s h]" },
+	{
+		channel = 0, instrument = "bass",
+		pattern = "a2 .  .  .  .  .  e2 .  a2 .  .  .  g2 .  .  ."
+	},
+	{
+		channel = 1, instrument = "lead",
+		pattern = ".  .  .  .  a4 .  .  .  .  .  c5 .  .  .  e5 ="
+	},
+	{
+		channel = 2, instrument = "arp",
+		pattern = "a4 c5 e5 c5 a4 c5 e5 c5 a4 c5 e5 c5 a4 c5 e5 c5"
+	},
+	{
+		-- busier amen-style break: syncopated kicks, ghost snares, hat & snare rolls
+		channel = 3, drums = true,
+		pattern = "k  .  h  [s s] s  .  h  k  .  k  h  s  s  [h h] .  [s h]"
+	},
 }
 
 -- =============================================================================
 -- ENGINE -- to compose, edit above; leave this alone.
 -- =============================================================================
 
--- Pre-compile every lane into an absolute-frame schedule for the whole loop.
+-- Pre-compile every (non-muted) lane into an absolute-frame schedule.
 local barLength = PATTERN.steps * PATTERN.framesPerStep
 local schedule = {}   -- schedule[frame] = { {lane=, atom=}, ... }
-for laneIndex, lane in ipairs(LANES) do
+
+local function scheduleLane(laneIndex, lane)
+	if lane.off then return end
 	for _, event in ipairs(compileLane(lane.pattern, PATTERN.framesPerStep)) do
 		schedule[event.frame] = schedule[event.frame] or {}
 		table.insert(schedule[event.frame], { lane = laneIndex, atom = event.atom })
 	end
 end
 
+for laneIndex, lane in ipairs(LANES) do
+	scheduleLane(laneIndex, lane)
+end
+
 local voices = {}
 for c = 0, CHANNELS - 1 do
-	voices[c] = { on = false, mode = "melodic", age = 0, hz = 0,
-		releasing = false, releaseAge = 0, instrument = nil }
+	voices[c] = { on = false, mode = MODE_MELODIC, age = 0, hz = 0,
+		releasing = false, releaseAge = 0, instrument = nil, waveTable = nil }
 end
 local playFrame = 0
+local clock = 0   -- free-running frame counter for LFOs (never wraps at bar end)
 
 -- Envelope volume [0..15] for a pitched voice.
 local function envelopeVolume(instrument, age, releasing, releaseAge)
 	if releasing then
-		local v = instrument.sustain
+		local level = instrument.sustain
 			- floor(releaseAge * instrument.sustain / (instrument.release + 1))
-		return (v > 0) and v or 0
+		return (level > 0) and level or 0
 	end
 	if age < instrument.attack then
 		return floor(instrument.peak * age / instrument.attack)
@@ -214,17 +292,43 @@ local function envelopeVolume(instrument, age, releasing, releaseAge)
 	return instrument.sustain
 end
 
--- Write frequency + volume + waveform to a channel's registers.
-local function pokeChannel(c, hz, volume, waveTable)
-	local base = SOUND_BASE + 18 * c
-	local freq = floor(hz + 0.5)
-	if freq < 0 then freq = 0 elseif freq > 0xFFF then freq = 0xFFF end
-	poke(base, freq & 0xFF)
-	poke(base + 1, ((freq >> 8) & 0x0F) | ((volume & 0x0F) << 4))
-	local waveNibble = (base + 2) * 2
+-- Load a channel's 32-nibble waveform. MUST be rewritten every frame: TIC-80's
+-- sound engine clears the waveform registers each tick, so a waveform set only
+-- once decays to all-zero -- which the chip plays as NOISE, not silence.
+local function setWaveform(c, waveTable)
+	local waveNibble = (SOUND_BASE + CHANNEL_STRIDE * c + 2) * 2
 	for i = 0, 31 do
 		poke4(waveNibble + i, waveTable[i + 1])
 	end
+end
+
+-- Scratch waveform reused for PWM so we don't allocate a table every frame.
+local dutyBuffer = {}
+
+-- Fill a 32-nibble buffer with a pulse wave of the given duty (0..1).
+local function fillPulse(buffer, duty)
+	local threshold = floor(duty * 32 + 0.5)
+	for i = 0, 31 do
+		buffer[i + 1] = (i < threshold) and 15 or 0
+	end
+end
+
+-- Update just frequency + volume for a channel (cheap; safe to call per frame).
+local function pokeFreqVol(c, hz, volume)
+	local base = SOUND_BASE + CHANNEL_STRIDE * c
+	local freq = floor(hz + 0.5)
+	if freq < 0 then
+		freq = 0
+	elseif freq > FREQ_MAX then
+		freq = FREQ_MAX
+	end
+	poke(base, freq & 0xFF)
+	poke(base + 1, ((freq >> 8) & 0x0F) | ((volume & 0x0F) << 4))
+end
+
+-- Silence a channel (zero its volume nibble).
+local function silenceChannel(c)
+	poke(SOUND_BASE + CHANNEL_STRIDE * c + 1, 0)
 end
 
 -- Fire a scheduled hit on its lane's channel.
@@ -233,71 +337,101 @@ local function triggerLane(laneIndex, atom)
 	local voice = voices[lane.channel]
 	if lane.drums then
 		local instrument = DRUMS[atom]
-		if instrument then
-			voice.instrument, voice.mode = instrument, "drum"
-			voice.age, voice.on, voice.releasing = 0, true, false
-		end
-	elseif atom == "=" then
-		voice.releasing, voice.releaseAge = true, 0
-	else
-		local hz = parseHz(atom)
-		if hz then
-			voice.hz = hz * 2 ^ (TRANSPOSE / 12)
-			voice.instrument = INSTRUMENTS[lane.instrument]
-			voice.mode = "melodic"
-			voice.age, voice.on, voice.releasing = 0, true, false
-		end
+		if not instrument then return end
+		voice.instrument, voice.mode = instrument, MODE_DRUM
+		voice.age, voice.on, voice.releasing = 0, true, false
+		voice.waveTable = WAVEFORMS[instrument.wave]
+		return
 	end
+	if atom == TOKEN_OFF then
+		voice.releasing, voice.releaseAge = true, 0
+		return
+	end
+	local hz = parseHz(atom)
+	if not hz then return end
+	voice.hz = hz * 2 ^ (TRANSPOSE / 12)
+	voice.instrument = INSTRUMENTS[lane.instrument]
+	voice.mode = MODE_MELODIC
+	voice.age, voice.on, voice.releasing = 0, true, false
+	voice.waveTable = WAVEFORMS[voice.instrument.wave]
+end
+
+-- Advance a drum (one-shot) voice by one frame.
+local function updateDrumVoice(c, voice, instrument)
+	if voice.age >= instrument.ampFrames then
+		voice.on = false
+		silenceChannel(c)
+		return
+	end
+	local volume = floor(instrument.peak * (1 - voice.age / instrument.ampFrames))
+	if volume < 0 then volume = 0 end
+	local hz
+	if instrument.wave == WAVE_NOISE then
+		hz = instrument.noiseFreq
+		if instrument.noiseFreqEnd then
+			hz = hz + (instrument.noiseFreqEnd - hz) * (voice.age / instrument.ampFrames)
+		end
+	else
+		local sweep = (voice.age < instrument.pitchFrames)
+			and (voice.age / instrument.pitchFrames) or 1
+		hz = instrument.pitchStart + (instrument.pitchEnd - instrument.pitchStart) * sweep
+	end
+	setWaveform(c, voice.waveTable)
+	pokeFreqVol(c, hz, volume)
+	voice.age = voice.age + 1
+end
+
+-- Advance a pitched (melodic) voice by one frame.
+local function updateMelodicVoice(c, voice, instrument)
+	if instrument.gate and not voice.releasing and voice.age >= instrument.gate then
+		voice.releasing, voice.releaseAge = true, 0
+	end
+	local volume = envelopeVolume(instrument, voice.age, voice.releasing, voice.releaseAge)
+	if voice.releasing then
+		voice.releaseAge = voice.releaseAge + 1
+		if volume <= 0 then voice.on = false end
+	end
+	local hz = voice.hz
+	if instrument.vibratoDepth > 0 then
+		local wobble = sin(voice.age / 60 * instrument.vibratoRate * TAU)
+		hz = hz * (1 + wobble * instrument.vibratoDepth * 0.003)
+	end
+	-- Reese: alternate between the note and a detuned copy each frame to fake
+	-- two beating oscillators (jungle bass) on a single channel.
+	if instrument.reeseDetune and voice.age % 2 == 1 then
+		hz = hz * (1 + instrument.reeseDetune)
+	end
+	-- PWM: rebuild the pulse each frame with an LFO-swept duty (evolving lead).
+	if instrument.pwm then
+		local duty = 0.5 + sin(clock / 60 * instrument.pwmRate * TAU) * instrument.pwmDepth
+		if duty < 0.1 then duty = 0.1 elseif duty > 0.9 then duty = 0.9 end
+		fillPulse(dutyBuffer, duty)
+		setWaveform(c, dutyBuffer)
+	else
+		setWaveform(c, voice.waveTable)
+	end
+	pokeFreqVol(c, hz, volume)
+	voice.age = voice.age + 1
+end
+
+-- Advance one channel's voice; silence it if nothing is playing.
+local function updateVoice(c)
+	local voice = voices[c]
+	local instrument = voice.instrument
+	if not (instrument and voice.on) then
+		silenceChannel(c)
+		return
+	end
+	if voice.mode == MODE_DRUM then
+		updateDrumVoice(c, voice, instrument)
+		return
+	end
+	updateMelodicVoice(c, voice, instrument)
 end
 
 local function updateVoices()
 	for c = 0, CHANNELS - 1 do
-		local voice = voices[c]
-		local instrument = voice.instrument
-		if instrument and voice.on then
-			if voice.mode == "drum" then
-				if voice.age < instrument.ampFrames then
-					local volume = floor(instrument.peak
-						* (1 - voice.age / instrument.ampFrames))
-					if volume < 0 then volume = 0 end
-					local hz, wave
-					if instrument.wave == "noise" then
-						hz, wave = instrument.noiseFreq, WAVEFORMS.noise
-					else
-						local t = (voice.age < instrument.pitchFrames)
-							and (voice.age / instrument.pitchFrames) or 1
-						hz = instrument.pitchStart
-							+ (instrument.pitchEnd - instrument.pitchStart) * t
-						wave = WAVEFORMS[instrument.wave]
-					end
-					pokeChannel(c, hz, volume, wave)
-					voice.age = voice.age + 1
-				else
-					voice.on = false
-					poke(SOUND_BASE + 18 * c + 1, 0)
-				end
-			else
-				if instrument.gate and not voice.releasing
-						and voice.age >= instrument.gate then
-					voice.releasing, voice.releaseAge = true, 0
-				end
-				local volume = envelopeVolume(instrument, voice.age,
-					voice.releasing, voice.releaseAge)
-				if voice.releasing then
-					voice.releaseAge = voice.releaseAge + 1
-					if volume <= 0 then voice.on = false end
-				end
-				local hz = voice.hz
-				if instrument.vibratoDepth > 0 then
-					local wobble = sin(voice.age / 60 * instrument.vibratoRate * TAU)
-					hz = hz * (1 + wobble * instrument.vibratoDepth * 0.003)
-				end
-				pokeChannel(c, hz, volume, WAVEFORMS[instrument.wave])
-				voice.age = voice.age + 1
-			end
-		else
-			poke(SOUND_BASE + 18 * c + 1, 0)
-		end
+		updateVoice(c)
 	end
 end
 
@@ -315,15 +449,15 @@ local function DrawReadout()
 	for c = 0, CHANNELS - 1 do
 		local y = 34 + c * 15
 		print(LANE_NAMES[c + 1], 6, y, 6)
-		local base = SOUND_BASE + 18 * c
+		local base = SOUND_BASE + CHANNEL_STRIDE * c
 		local volume = (peek(base + 1) >> 4) & 0x0F
 		rect(44, y, volume * 10, 8, volume > 0 and (8 + c) or 15)
 	end
 	-- Playhead over the 16-step grid.
-	for s = 0, PATTERN.steps - 1 do
-		local x = 6 + s * 14
+	for i = 0, PATTERN.steps - 1 do
+		local x = 6 + i * 14
 		rectb(x, 100, 12, 8, 15)
-		if s == step then rect(x + 1, 101, 10, 6, 11) end
+		if i == step then rect(x + 1, 101, 10, 6, 11) end
 	end
 	print("edit LANES / INSTRUMENTS / DRUMS to compose", 6, 122, 13, false, 1, true)
 end
@@ -335,6 +469,7 @@ function TIC()
 	end
 	updateVoices()
 	DrawReadout()
+	clock = clock + 1
 	playFrame = playFrame + 1
 	if playFrame >= barLength then playFrame = 0 end
 end

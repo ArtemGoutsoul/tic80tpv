@@ -1,0 +1,6 @@
+{
+  "runtime.version": "Lua 5.4",
+  "diagnostics.globals": [
+    "TIC", "BOOT", "BDR", "OVR", "MENU", "SCN"
+  ]
+}

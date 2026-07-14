@@ -40,6 +40,29 @@ There is no third "emit samples" option. (PCM "playback" carts fake it by
 streaming bytes into the waveform register at a few kHz — a size-coding trick,
 not general audio.)
 
+## Field notes (hard-won, verified in this project — read these first)
+
+The landmines, in the order they'll bite you. Details in the sections below.
+
+1. **A text cart with no `<PALETTE>` section loads an all-black palette** — every
+   `cls`/`print`/`rect` colour draws as black. Symptom: black screen *with working
+   sound*. Always include a palette. (See "Two gotchas".)
+2. **`tic80.exe cart.lua` loads but does NOT auto-run** (build 1.1.x). Run it with
+   positional cart + `--cmd="run"`, or `Ctrl+R` in the window. (See "Two gotchas".)
+3. **When driving the sound registers, rewrite the WAVEFORM every frame.** TIC-80
+   clears the waveform registers each tick; a waveform set once decays to all-zero
+   next frame = **noise**. Pitch/volume look fine (rewritten each frame) so only the
+   *timbre* breaks — every pitched voice quietly turns to noise. (See level 3.)
+4. **The 12-bit frequency register value ≈ the output pitch in Hz** — poke
+   `round(440 * 2^((midi-69)/12))`. Relative tuning is exact; verify absolute pitch
+   by ear. (See "Note → frequency".)
+5. **A low sawtooth is buzzy/gritty** (energy in every harmonic) and reads as harsh;
+   use `triangle`/`sine` for a clean sub, `saw` deliberately for a reese. (See
+   "Synth voice techniques".)
+6. **You cannot screenshot sound**, and pitch/timbre correctness can't be seen — an
+   on-screen readback of the registers (`peek`) is the only in-cart way to verify
+   what the synth is actually reading; final judgement is by ear.
+
 ## Three levels of control
 
 | Level | You call | You control | Use when |
@@ -153,9 +176,15 @@ To parse `"C#4"`-style names: `midi = (octave + 1) * 12 + semitone`, where
 
 ### Key facts & gotchas (level 3)
 
-- **Poke every frame.** The registers drive the DAC continuously; write them
-  each `TIC()`. Don't mix `sfx()`/`music()` on a channel you're register-driving
-  — they write the same registers and will fight you.
+- **Poke every frame — INCLUDING the waveform.** TIC-80's sound engine *clears
+  the waveform registers every tick*, so you must rewrite a channel's 32-nibble
+  waveform on **every** `TIC()`, not just when a note starts. A waveform written
+  once decays to all-zero next frame, and an all-zero waveform is **noise** — so
+  a "set the waveform once" optimization silently turns every pitched voice into
+  noise (pitch/volume, written each frame, still look correct — only the timbre
+  is wrong). Rewriting freq + volume + waveform every frame is the safe default.
+- Don't mix `sfx()`/`music()` on a channel you're register-driving — they write
+  the same registers and will fight you.
 - Envelope, vibrato, arpeggio, slide are **yours to compute** (track "frames
   since note-on" per channel and derive volume/pitch from it).
 - Volume in the SFX macro editor is *inverted* (editor 15→0 maps to stored 0→15);
@@ -179,8 +208,9 @@ The cart already ships three in its `<WAVES>` section: `square`, `ramp`,
 
 Ships with this skill's project. A self-contained **code synthesizer + code
 tracker** (level 3). It uses **per-lane mini-notation strings** (below),
-**synthesized drums** (kick/snare/hat multiplexed on one channel), and a
-**frame scheduler** so subdivided rolls land off the main grid. Waveforms,
+**synthesized drums** (kick/snare/hat multiplexed on one channel), a **PWM
+lead** and **reese bass** (see "Synth voice techniques"), and a **frame
+scheduler** so subdivided rolls land off the main grid. Waveforms,
 instruments, drums and the song are all Lua tables; the engine pokes the sound
 registers each frame. Run it (see the launch gotcha below — a bare cart path
 loads but does **not** auto-run):
@@ -235,6 +265,28 @@ bass/lead/arp. Recipes (see [kometbomb](https://kometbomb.net/2011/10/11/chiptun
 Drum voices are one-shots (retrigger resets age); pitched voices sustain with an
 ADSR envelope and an optional `gate` (auto note-off after N frames). For d&b,
 16 steps × 5 frames/step ≈ 180 BPM.
+
+## Synth voice techniques (single-channel tricks)
+
+Because you rebuild the waveform and frequency every frame anyway, richer voices
+are cheap — all verified in the demo:
+
+- **PWM lead** — regenerate a *pulse* waveform each frame with a duty cycle swept
+  by a slow LFO: `duty = 0.5 + sin(clock/60 * rate * TAU) * depth` (clamp to
+  ~0.1–0.9 so it never hits all-0/all-15 = noise), then rebuild the 32-nibble
+  table and `setWaveform`. Gives the classic evolving hollow↔full chip lead. Use a
+  **free-running** clock, not per-note age, so the sweep is continuous across notes.
+- **Reese / detuned bass** — fake two detuned oscillators on one channel by
+  alternating the frequency every frame between the note and a slightly detuned
+  copy (`hz * (1 + detune)` on odd frames, `detune ≈ 0.02`). On a `saw` this is
+  jungle's gnarly reese; smaller detune = subtler thickening.
+- **Fast arpeggio = chords** — with only 4 channels, imply a chord by cycling one
+  channel through its notes at 16th/32nd speed (the arp lane). A staple chiptune move.
+- **Drum synthesis** — see "Synthesized drums": pitch-swept triangle (kick),
+  noise-freq-swept noise (snare), short noise (hat), all multiplexed on one channel.
+
+Reusable scratch buffer for per-frame waveform generation (avoid per-frame table
+allocation / GC): keep one module-level table and refill it in place.
 
 ## Two gotchas that will waste an hour (learned the hard way)
 
