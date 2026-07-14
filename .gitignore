@@ -1,5 +1,5 @@
-# Claude Code session/scratch
-.claude/
+# Claude Code: share skills/settings in .claude/, but keep personal local settings out
+.claude/settings.local.json
 .local/
 .screenshots/
 

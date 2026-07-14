@@ -13,9 +13,11 @@ The project is currently in development (work in progress).
 - **tpv.lua** - Main demo source file (work in progress):
   - Demo metadata in header comments
   - Global variables and demo state
+  - Helper functions: `waveX`/`waveY` (shared wave field), `ditheredTri` and `drawPyramid`/`drawPyramidGrid` (the pyramid mesh), `drawLogoShadow` and `drawLogoOnTop` (the logo)
   - TIC() function - the main demo loop called 60 times per second
-  - Demo effects functions (e.g., Pir() for animated pyramid effects)
-  - Embedded data sections: TILES, WAVES, SFX, TRACKS, PALETTE
+  - Embedded data sections: TILES, SPRITES, WAVES, SFX, TRACKS, PALETTE
+
+- **snow.lua** - Standalone secondary cart: procedural 6-fold-symmetric snowfall with parallax depth layers, sine-wave drift, and spacebar-triggered wind gusts
 
 - **tic80stubs.lua** - TIC-80 API type definitions for Lua LSP (EmmyLua format)
   - Provides autocomplete and type checking for TIC-80 API functions
@@ -24,6 +26,14 @@ The project is currently in development (work in progress).
 - **october.tic** - Test music for the demo
 
 - **tpv01.png, tpv02.gif** - Logo drafts for "Total Perspective Vortex"
+
+- **docs/** - Background and reference notes (searched on demand, not loaded every session):
+  - **total-perspective-vortex.md** - Summary of Douglas Adams' Hitchhiker's Guide works and the Total Perspective Vortex (the demo's theme and source material)
+  - **tic80-api-reference.md** - Indexed TIC-80 API quick reference (moved out of this file); full per-function docs in `tic80wiki/`
+
+- **.claude/skills/** - Task playbooks auto-surfaced by trigger words (local-only; `.claude/` is gitignored):
+  - **tic80-sound** - Making sound/music in TIC-80 from Lua (API, instrument RAM, raw sound registers)
+  - **tic80-screenshot** - Screenshotting the running TIC-80 window to verify visual changes from an automated session
 
 ## TIC-80 Development Commands
 
@@ -55,49 +65,11 @@ Start-Process -FilePath "C:\dev\tic80\tic80.exe" -ArgumentList "C:\dev\tic80\tes
 
 ### Screenshot capture (window grab)
 
-For verifying visual changes from an automated session, capture the TIC-80 window via `System.Drawing` + `GetWindowRect`:
-
-```powershell
-Add-Type -AssemblyName System.Drawing
-Add-Type @'
-using System; using System.Runtime.InteropServices;
-public class Win32 {
-    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
-    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
-    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
-    [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
-}
-'@
-$proc = Get-Process tic80 | ? { $_.MainWindowHandle -ne 0 } | Select -First 1
-[Win32]::ShowWindow($proc.MainWindowHandle, 9) | Out-Null  # SW_RESTORE
-[Win32]::SetForegroundWindow($proc.MainWindowHandle) | Out-Null
-Start-Sleep -Milliseconds 800  # let the window come forward and redraw
-$rect = New-Object Win32+RECT
-[Win32]::GetWindowRect($proc.MainWindowHandle, [ref]$rect) | Out-Null
-$bmp = New-Object System.Drawing.Bitmap(($rect.Right - $rect.Left), ($rect.Bottom - $rect.Top))
-$g = [System.Drawing.Graphics]::FromImage($bmp)
-$g.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $bmp.Size)
-$bmp.Save('.screenshots/<name>.png', [System.Drawing.Imaging.ImageFormat]::Png)
-```
-
-Notes:
-- **Each `PowerShell` tool call has fresh shell state** — `Add-Type` definitions don't persist between calls, so re-declare them in every screenshot script.
-- The screen capture reads whatever pixels are currently on-screen at the window's rect — if the OS lock screen is up, you'll capture the lock screen, not TIC-80.
-- After restarting TIC-80 (`Stop-Process` + `Start-Process`), wait ~3–4 seconds before screenshotting so the cart has time to compile and run; otherwise you'll catch the boot/loading screen.
-
-#### Screenshot folder & cleanup
-
-- Save screenshots to `.screenshots/` in the project root, **not** the project root itself, **not** `.local/`. The folder name is gitignored (see `.gitignore` — create one with `.screenshots/` and `.local/` listed if it doesn't exist yet).
-- Use descriptive names that reflect what's being verified (`tic80_shadow_subpixel.png`, `tic80_wavy_irregular.png`) — the folder is a debugging scratchpad, not history we want to preserve.
-- **Clean up old screenshots at the start of a screenshotting session** (anything older than ~1 hour is from a prior session and isn't useful):
-
-```powershell
-Get-ChildItem .screenshots -File -ErrorAction SilentlyContinue |
-  Where-Object LastWriteTime -lt (Get-Date).AddHours(-1) |
-  Remove-Item
-```
-
-Doing this only at session start (not after every screenshot) preserves intra-session comparisons while keeping the folder from growing without bound.
+To verify a visual change by screenshotting the running TIC-80 window from an
+automated session, use the **tic80-screenshot** skill. It covers the Windows
+`System.Drawing` + `GetWindowRect` window grab, the `.screenshots/` folder
+convention with session-start cleanup, and the gotchas (minimized window →
+blank grab, fresh-shell `Add-Type`, waiting ~3–4 s for the cart to compile).
 
 ## TIC-80 Architecture
 
@@ -121,7 +93,7 @@ Doing this only at session start (not after every screenshot) preserves intra-se
 2. Global variable declarations
 3. Helper functions
 4. TIC() function implementation
-5. Embedded data sections (TILES, WAVES, SFX, TRACKS, PALETTE)
+5. Embedded data sections (TILES, SPRITES, WAVES, SFX, TRACKS, PALETTE)
 
 ## Demoscene Context
 
@@ -129,7 +101,7 @@ This is a **demoscene production** - an audiovisual artistic demo showcasing pro
 - Real-time generated effects synchronized to music
 - Creative use of limited resources (240x136 screen, 16-color palette)
 - Mathematical/procedural animations and visual effects
-- Thematic coherence (in this case: Douglas Adams' "Total Perspective Vortex")
+- Thematic coherence (in this case: Douglas Adams' "Total Perspective Vortex" — see [docs/total-perspective-vortex.md](docs/total-perspective-vortex.md) for the source material)
 
 ## Development Notes
 
@@ -145,6 +117,31 @@ This is a **demoscene production** - an audiovisual artistic demo showcasing pro
 - Examples:
   - Good: `scanline`, `wave`, `address`, `color`
   - Avoid: `s`, `w`, `addr`, `col` (except in standard contexts)
+
+### General Lua style (community consensus)
+
+Summarized from the [LuaRocks/Olivine-Labs style guide](https://github.com/luarocks/lua-style-guide) and the [lua-users wiki Style Guide](http://lua-users.org/wiki/LuaStyleGuide). Where this repo deliberately differs, the house conventions below win — the golden rule is **be consistent with the surrounding code**.
+
+- **Scope:** always declare with `local`; never create accidental globals. Give a variable the smallest scope that works. The wider the scope, the more descriptive the name (a one-letter name is fine in a tight loop, wrong for a module-level value).
+- **Naming (mainstream default):** `snake_case` for variables and functions, `UPPER_SNAKE_CASE` for true constants, `PascalCase` for classes/types, lowercase for module names. Prefix boolean-returning functions with `is`/`has`. Use `_` for a value you intentionally ignore. Names starting with `_UPPERCASE` are reserved by Lua — don't define them.
+- **One statement per line;** never terminate statements with semicolons. Keep single-line `if ... then ... end` only for trivial `then return` / `then break` guards; use multi-line blocks otherwise.
+- **Spacing:** one space after `--`, around binary operators, and after commas; no space between a function name and its `(`; no spaces just inside `(` `)` or `{` `}`. Blank line between function definitions. Don't column-align assignments (noisy diffs — but see the deliberate ramp/table alignment in this repo, which is a readability exception for data tables).
+- **Calls & tables:** use parentheses on calls (`require("x")`, `f("s")`), even for single string/table args. Prefer `t.field` over `t["field"]` unless the key isn't a valid identifier. Trailing commas on multi-line table literals are encouraged.
+- **`and`/`or` idiom:** fine for a pseudo-ternary (`x = cond and a or b`), but not when the "true" branch can be `false`/`nil` — it silently falls through to the `or` branch.
+- **Comments:** explain *why*, not *how*; if a block needs a lot of inline how-to, that's a hint to extract a well-named function. Use `TODO` for missing features and `FIXME` for known bugs.
+- **Errors:** return `nil, message` for expected/recoverable failures (I/O, parsing); use `error()`/`assert()` for programmer mistakes (bad arguments, broken invariants).
+- **Static analysis:** code should pass [luacheck](https://github.com/lunarmodules/luacheck) with defaults; keep a `.luacheckrc` for intentional exceptions rather than scattering inline ignores.
+
+### House conventions (this repo)
+
+`tpv.lua` follows the community rules above **except** where TIC-80 / demoscene practice or the existing code says otherwise. Match these when editing:
+
+- **Indentation: tabs**, not spaces (the project is formatted with tabs; don't reintroduce spaces). This is the one clear departure from the mainstream "spaces only" advice — consistency with the existing file wins.
+- **Function naming: `camelCase` for every function and local** — both the top-level drawing/effect routines (`ditheredTri`, `drawPyramid`, `drawPyramidGrid`, `drawLogoShadow`, `drawLogoOnTop`) and the small helpers (`waveX`, `waveY`, `logoMaskAddr`, `cellCols`, `edgeWeight`, `brightStep`). We diverge from the mainstream `snake_case` default, but stay uniform: no `snake_case`, and no `PascalCase` (which Lua reserves for classes/types — this demo has none).
+  - TIC-80 callbacks stay ALL-CAPS because the platform requires it (`TIC`, `BOOT`, `BDR`, `OVR`, `MENU`, `SCN`).
+- **Constants** are `UPPER_SNAKE_CASE` module-level `local`s declared at the top of the file, before any function that uses them (see the "Lua / TIC-80 Gotchas" note on `local` ordering).
+- **Localize hot library functions** at the top of inner-loop functions (`local floor, random = math.floor, math.random`) — a performance idiom, covered under "Performance budget".
+- No globals, no semicolons, parentheses on calls — same as the mainstream rules.
 
 ## Demoscene Techniques in tpv.lua
 
@@ -169,14 +166,11 @@ local nibble  = peek4(0xC000 + localId * 64 + py * 8 + px)
 -- 0 = transparent (typical), otherwise the palette index
 ```
 
-This is how `DrawLogoShadow` tests the logo's transparency mask without re-rendering the sprite.
+This is how `drawLogoShadow` tests the logo's transparency mask without re-rendering the sprite.
 
 ### Dithered gradients (faking >16 colors)
 
-Two complementary patterns are used:
-
-1. **`DrawDitheredGradient(x, y, w, h, colorList)`** (rectangular). Per-row brightness is constant, so the 4-pixel Bayer (or random) pattern is precomputed once per row and the inner loop is just a `poke4`. Cheap enough for full-screen backgrounds.
-2. **`DitheredTri(x1, y1, x2, y2, x3, y3, colorList, b1, b2, b3)`** (arbitrary triangle). Scanline rasterizer: vertices sorted by Y, left/right `x` and `brightness` advanced incrementally along the triangle edges, brightness then steps once per pixel across each scanline. A per-pixel `math.random(0, 15)` threshold picks between the two adjacent stops in `colorList`, producing animated white-noise dither.
+**`ditheredTri(x1, y1, x2, y2, x3, y3, colorList, b1, b2, b3)`** (arbitrary triangle) is the workhorse. Scanline rasterizer: vertices sorted by Y, left/right `x` and `brightness` advanced incrementally along the triangle edges, brightness then steps once per pixel across each scanline. A per-pixel `math.random(0, 15)` threshold picks between the two adjacent stops in `colorList`, producing animated white-noise dither. The four faces of every pyramid are drawn this way (see `drawPyramid`).
 
 `colorList` is an ordered ramp of palette indices from dark to light (e.g. `{4, 9, 14, 15}` = brown → orange → yellow → white). The per-vertex `bN` values in `[0, 1]` map to a position along the ramp.
 
@@ -189,11 +183,11 @@ local fx = math.floor(targetX)
 local sx = (math.random() < targetX - fx) and (fx + 1) or fx
 ```
 
-As `targetX` smoothly crosses 4.0 → 4.5 → 5.0, the proportion of pixels at `fx + 1` grows 0% → 50% → 100%. The visible centroid moves continuously even though every pixel is still on the integer grid. Used by `DrawLogoShadow` so the shadow doesn't snap as its offset changes.
+As `targetX` smoothly crosses 4.0 → 4.5 → 5.0, the proportion of pixels at `fx + 1` grows 0% → 50% → 100%. The visible centroid moves continuously even though every pixel is still on the integer grid. Used by `drawLogoShadow` so the shadow doesn't snap as its offset changes.
 
 ### Wavy mesh via shared-corner table
 
-`DrawPyramidGrid` builds a `(cellCols + 1) × (cellRows + 1)` table of warped corner positions once per frame and looks them up per cell. Adjacent cells share corners exactly (no overlap, no gap), so the grid bends like a sheet of cloth. The outer ring of corners is anchored (`edgeWeight = 0`) so the screen border stays covered. **Snap corners to integer pixels** with `math.floor(x + 0.5)` to avoid sub-pixel rounding artifacts at shared rasterizer edges.
+`drawPyramidGrid` builds a `(cellCols + 1) × (cellRows + 1)` table of warped corner positions once per frame and looks them up per cell. Adjacent cells share corners exactly (no overlap, no gap), so the grid bends like a sheet of cloth. The outer ring of corners is anchored (`edgeWeight = 0`) so the screen border stays covered. **Snap corners to integer pixels** with `math.floor(x + 0.5)` to avoid sub-pixel rounding artifacts at shared rasterizer edges.
 
 ### Coupling effects to one wave function
 
@@ -201,7 +195,7 @@ When two effects should look like they belong to the same world, key them off th
 
 ### Per-palette darkening LUT
 
-For a "darken this pixel by one shade" effect (drop shadow, pressed-button highlight, etc.), hand-tune a 16-entry table mapping each palette index to its darker counterpart. Apply twice for a deeper darken. The DB16 mapping in `SHADOW_DARKEN` walks warm colors toward brown and cool colors toward dark blue.
+For a "darken this pixel by one shade" effect (drop shadow, pressed-button highlight, etc.), hand-tune a 16-entry table mapping each palette index to its darker counterpart. Nest the lookup for a deeper darken — `drawLogoShadow` applies `SHADOW_DARKEN` two or three levels deep and dithers 50/50 between the two depths, so the shadow edge reads as soft rather than a hard step. The DB16 mapping in `SHADOW_DARKEN` walks warm colors toward brown and cool colors toward dark blue.
 
 ## Lua / TIC-80 Gotchas
 
@@ -225,110 +219,8 @@ At 60 FPS on TIC-80 Lua:
 
 ## TIC-80 API Reference
 
-Complete TIC-80 API documentation is available in `tic80wiki/` folder (local copy of the official TIC-80 wiki documentation).
-
-### Platform Concepts
-
-- **[RAM](tic80wiki/RAM.md)** - Memory map (96KB addressable: sprites, map, sound, code, etc.)
-- **[Palette](tic80wiki/Palette.md)** - 16 colors (indices 0-15), customizable per scanline
-- **[Sprites](tic80wiki/Sprite-Editor.md)** - 8×8 pixel tiles, 512 sprites total
-- **[Map](tic80wiki/Map-Editor.md)** - 240×136 cells (each references a sprite)
-- **[Bankswitching](tic80wiki/Bankswitching.md)** - Switch between 8 banks of assets
-- **[Coordinate System](tic80wiki/coordinate.md)** - Screen is 240×136 pixels, origin at (0,0) top-left
-
-### API Quick Reference
-
-#### Callbacks
-
-| Function | Signature | Description | Docs |
-|----------|-----------|-------------|------|
-| **TIC** | `TIC()` | Main loop, called 60 times/second (required) | [tic80wiki/TIC.md](tic80wiki/TIC.md) |
-| **BOOT** | `BOOT()` | Called once on cartridge boot | [tic80wiki/BOOT.md](tic80wiki/BOOT.md) |
-| **BDR** | `BDR(scanline)` | Called before each scanline (0-143) | [tic80wiki/BDR.md](tic80wiki/BDR.md) |
-| **OVR** | `OVR()` | Draw overlay layer (deprecated, use vbank) | [tic80wiki/OVR.md](tic80wiki/OVR.md) |
-| **MENU** | `MENU(index)` | Handle custom menu items | [tic80wiki/MENU.md](tic80wiki/MENU.md) |
-| **SCN** | `SCN(scanline)` | Per-scanline callback (deprecated, use BDR) | [tic80wiki/SCN.md](tic80wiki/SCN.md) |
-
-#### Drawing Functions
-
-| Function | Signature | Description | Docs |
-|----------|-----------|-------------|------|
-| **cls** | `cls([color=0])` | Clear screen with color | [tic80wiki/cls.md](tic80wiki/cls.md) |
-| **clip** | `clip([x, y, width, height])` | Set/reset clipping region | [tic80wiki/clip.md](tic80wiki/clip.md) |
-| **pix** | `pix(x, y, [color])` | Get/set pixel color | [tic80wiki/pix.md](tic80wiki/pix.md) |
-| **line** | `line(x0, y0, x1, y1, color)` | Draw line | [tic80wiki/line.md](tic80wiki/line.md) |
-| **circ** | `circ(x, y, radius, color)` | Draw filled circle | [tic80wiki/circ.md](tic80wiki/circ.md) |
-| **circb** | `circb(x, y, radius, color)` | Draw circle border | [tic80wiki/circb.md](tic80wiki/circb.md) |
-| **elli** | `elli(x, y, a, b, color)` | Draw filled ellipse | [tic80wiki/elli.md](tic80wiki/elli.md) |
-| **ellib** | `ellib(x, y, a, b, color)` | Draw ellipse border | [tic80wiki/ellib.md](tic80wiki/ellib.md) |
-| **rect** | `rect(x, y, width, height, color)` | Draw filled rectangle | [tic80wiki/rect.md](tic80wiki/rect.md) |
-| **rectb** | `rectb(x, y, width, height, color)` | Draw rectangle border | [tic80wiki/rectb.md](tic80wiki/rectb.md) |
-| **tri** | `tri(x1, y1, x2, y2, x3, y3, color)` | Draw filled triangle | [tic80wiki/tri.md](tic80wiki/tri.md) |
-| **trib** | `trib(x1, y1, x2, y2, x3, y3, color)` | Draw triangle border | [tic80wiki/trib.md](tic80wiki/trib.md) |
-| **ttri** | `ttri(x1, y1, x2, y2, x3, y3, u1, v1, u2, v2, u3, v3, [texsrc=0], [chroma=-1], [z1=0], [z2=0], [z3=0])` | Draw textured triangle | [tic80wiki/ttri.md](tic80wiki/ttri.md) |
-| **spr** | `spr(id, x, y, [colorkey=-1], [scale=1], [flip=0], [rotate=0], [w=1], [h=1])` | Draw sprite(s) | [tic80wiki/spr.md](tic80wiki/spr.md) |
-| **map** | `map([x=0], [y=0], [w=30], [h=17], [sx=0], [sy=0], [colorkey=-1], [scale=1], [remap])` | Draw map region | [tic80wiki/map.md](tic80wiki/map.md) |
-| **print** | `print(text, [x=0], [y=0], [color=15], [fixed=false], [scale=1], [smallfont=false]) -> width` | Print text (system font) | [tic80wiki/print.md](tic80wiki/print.md) |
-| **font** | `font(text, x, y, [transcolor], [char_width=8], [char_height=8], [fixed=false], [scale=1], [alt=false]) -> width` | Print text (sprite font) | [tic80wiki/font.md](tic80wiki/font.md) |
-
-#### Input Functions
-
-| Function | Signature | Description | Docs |
-|----------|-----------|-------------|------|
-| **btn** | `btn([id]) -> pressed` | Get button state (held) | [tic80wiki/btn.md](tic80wiki/btn.md) |
-| **btnp** | `btnp([id], [hold=-1], [period=-1]) -> pressed` | Get button state (just pressed) | [tic80wiki/btnp.md](tic80wiki/btnp.md) |
-| **key** | `key([code]) -> pressed` | Get key state (held) | [tic80wiki/key.md](tic80wiki/key.md) |
-| **keyp** | `keyp([code], [hold=-1], [period=-1]) -> pressed` | Get key state (just pressed) | [tic80wiki/keyp.md](tic80wiki/keyp.md) |
-| **mouse** | `mouse() -> x, y, left, middle, right, scrollx, scrolly` | Get mouse/touch state | [tic80wiki/mouse.md](tic80wiki/mouse.md) |
-
-#### Sound Functions
-
-| Function | Signature | Description | Docs |
-|----------|-----------|-------------|------|
-| **sfx** | `sfx(id, [note=-1], [duration=-1], [channel=0], [volume=15], [speed=0])` | Play sound effect | [tic80wiki/sfx.md](tic80wiki/sfx.md) |
-| **music** | `music([track=-1], [frame=-1], [row=-1], [loop=true], [sustain=false], [tempo=-1], [speed=-1])` | Play music track | [tic80wiki/music.md](tic80wiki/music.md) |
-
-#### Memory Functions
-
-| Function | Signature | Description | Docs |
-|----------|-----------|-------------|------|
-| **peek** | `peek(addr, [bits=8]) -> value` | Read byte/nibble/bits from RAM | [tic80wiki/peek.md](tic80wiki/peek.md) |
-| **peek1** | `peek1(bitaddr) -> bit` | Read 1 bit from RAM | [tic80wiki/peek1.md](tic80wiki/peek1.md) |
-| **peek2** | `peek2(addr2) -> val2` | Read 2 bits from RAM | [tic80wiki/peek2.md](tic80wiki/peek2.md) |
-| **peek4** | `peek4(addr4) -> nibble` | Read 4 bits (nibble) from RAM | [tic80wiki/peek4.md](tic80wiki/peek4.md) |
-| **poke** | `poke(addr, value, [bits=8])` | Write byte/nibble/bits to RAM | [tic80wiki/poke.md](tic80wiki/poke.md) |
-| **poke1** | `poke1(bitaddr, bit)` | Write 1 bit to RAM | [tic80wiki/poke1.md](tic80wiki/poke1.md) |
-| **poke2** | `poke2(addr2, val2)` | Write 2 bits to RAM | [tic80wiki/poke2.md](tic80wiki/poke2.md) |
-| **poke4** | `poke4(addr4, nibble)` | Write 4 bits (nibble) to RAM | [tic80wiki/poke4.md](tic80wiki/poke4.md) |
-| **memcpy** | `memcpy(dest, source, size)` | Copy memory region | [tic80wiki/memcpy.md](tic80wiki/memcpy.md) |
-| **memset** | `memset(dest, value, size)` | Set memory region to value | [tic80wiki/memset.md](tic80wiki/memset.md) |
-| **pmem** | `pmem(index, [value]) -> value` | Persistent memory (256 bytes, 32-bit values) | [tic80wiki/pmem.md](tic80wiki/pmem.md) |
-| **sync** | `sync([mask=0], [bank=0], [tocart=false])` | Sync RAM to/from cartridge | [tic80wiki/sync.md](tic80wiki/sync.md) |
-| **vbank** | `vbank([bank]) -> prev_bank` | Switch video RAM bank (0-1) | [tic80wiki/vbank.md](tic80wiki/vbank.md) |
-
-#### Map/Sprite Utilities
-
-| Function | Signature | Description | Docs |
-|----------|-----------|-------------|------|
-| **mget** | `mget(x, y) -> tile_id` | Get map tile at coordinates | [tic80wiki/mget.md](tic80wiki/mget.md) |
-| **mset** | `mset(x, y, tile_id)` | Set map tile at coordinates | [tic80wiki/mset.md](tic80wiki/mset.md) |
-| **fget** | `fget(sprite_id, [flag]) -> value` | Get sprite flag(s) | [tic80wiki/fget.md](tic80wiki/fget.md) |
-| **fset** | `fset(sprite_id, [flag], value)` | Set sprite flag | [tic80wiki/fset.md](tic80wiki/fset.md) |
-
-#### System Functions
-
-| Function | Signature | Description | Docs |
-|----------|-----------|-------------|------|
-| **time** | `time() -> milliseconds` | Get elapsed time since start | [tic80wiki/time.md](tic80wiki/time.md) |
-| **tstamp** | `tstamp() -> unix_timestamp` | Get current Unix timestamp | [tic80wiki/tstamp.md](tic80wiki/tstamp.md) |
-| **exit** | `exit()` | Exit to console | [tic80wiki/exit.md](tic80wiki/exit.md) |
-| **reset** | `reset()` | Reset cartridge | [tic80wiki/reset.md](tic80wiki/reset.md) |
-| **trace** | `trace(message, [color=15])` | Print to console (debug) | [tic80wiki/trace.md](tic80wiki/trace.md) |
-
-### Additional Resources
-
-- **[Cheatsheet](tic80wiki/Cheatsheet.md)** - Quick reference sheet
-- **[Tutorials](tic80wiki/Tutorials.md)** - Step-by-step guides
-- **[Code Examples](tic80wiki/Code-examples-and-snippets.md)** - Useful code snippets
-- **[RAM Map](tic80wiki/RAM.md)** - Complete memory layout (0x00000-0x17FFF)
-- **[Key Map](tic80wiki/Key-Map.md)** - Keyboard/gamepad button IDs
+The full API index (callbacks, drawing, input, sound, memory, map/sprite, and
+system functions, each with signature and a link to per-function docs) lives in
+**[docs/tic80-api-reference.md](docs/tic80-api-reference.md)**. Complete
+per-function documentation is in the [`tic80wiki/`](tic80wiki/) folder (local
+copy of the official TIC-80 wiki). Look there rather than keeping it in context.

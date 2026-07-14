@@ -1,18 +1,20 @@
--- title:   game title
--- author:  game developer, email, etc.
--- desc:    short description
--- site:    website link
--- license: MIT License (change this to your license of choice)
+-- title:   Total Perspective Vortex
+-- author:  Artem Goutsoul
+-- desc:    A Douglas Adams inspired TIC-80 demoscene demo
+-- site:    https://github.com/ArtemGoutsoul/tic80tpv
+-- license: MIT License
 -- version: 0.1
 -- script:  lua
+
+-- Theme background: see docs/total-perspective-vortex.md for a summary of
+-- Douglas Adams' Hitchhiker's Guide works and the Total Perspective Vortex.
 
 -- Screen
 local SCREEN_W, SCREEN_H = 240, 136
 local MAX_X, MAX_Y = SCREEN_W - 1, SCREEN_H - 1
 
 -- Pyramid grid
-local GRID_SPACING = 28
-local PYRAMID_SIZE = GRID_SPACING       -- pyramids tile flush, no gaps
+local GRID_SPACING = 28                 -- pyramids tile flush to this grid, no gaps
 local APEX_AMP = 12                     -- per-cell apex orbit radius (px)
 local APEX_SPEED_DIV = 10000            -- larger = slower apex orbit
 
@@ -32,11 +34,12 @@ local WAVE_SPEED = 0.0042
 -- so the shadow stays in phase with the bending grid below.
 local function waveX(gxF, gyF, t)
 	return math.sin(t        + gxF * 0.45 + gyF * 0.6) * 0.6
-	     + math.sin(t * 1.73 + gxF * 0.9  + gyF * 0.3) * 0.4
+	+ math.sin(t * 1.73 + gxF * 0.9  + gyF * 0.3) * 0.4
 end
+
 local function waveY(gxF, gyF, t)
 	return math.cos(t * 1.1  + gxF * 0.7 + gyF * 0.4) * 0.6
-	     + math.cos(t * 0.83 + gxF * 0.4 + gyF * 0.8) * 0.4
+	+ math.cos(t * 0.83 + gxF * 0.4 + gyF * 0.8) * 0.4
 end
 
 -- Logo
@@ -64,22 +67,30 @@ local SHADOW_DEPTH = 0.4                -- how strongly height pulls the offset
 -- Per-palette-index "one shade darker" lookup, hand-tuned for DB16: warm
 -- colors fall toward brown, cool toward dark blue, dark indices saturate at 0.
 local SHADOW_DARKEN = {
-	[0]  = 0,  [1]  = 0, [2]  = 0, [3]  = 1,
-	[4]  = 1,  [5]  = 1, [6]  = 4, [7]  = 1,
-	[8]  = 2,  [9]  = 4, [10] = 3, [11] = 5,
+	[0] = 0,  [1] = 0, [2] = 0, [3] = 1,
+	[4] = 1,  [5] = 1, [6] = 4, [7] = 1,
+	[8] = 2,  [9] = 4, [10] = 3, [11] = 5,
 	[12] = 7,  [13] = 8, [14] = 9, [15] = 10,
 }
 
 -- Scanline triangle filled with a dithered gradient through colorList.
 -- Per-vertex brightness (b1..b3, in 0..1) is interpolated; a per-pixel random
 -- threshold picks between the two adjacent ramp stops.
-local function DitheredTri(x1, y1, x2, y2, x3, y3, colorList, b1, b2, b3)
+local function ditheredTri(x1, y1, x2, y2, x3, y3, colorList, b1, b2, b3)
 	local segments = #colorList - 1
-	if segments < 1 then return end
+	if segments < 1 then
+		return
+	end
 
-	if y1 > y2 then x1, y1, b1, x2, y2, b2 = x2, y2, b2, x1, y1, b1 end
-	if y2 > y3 then x2, y2, b2, x3, y3, b3 = x3, y3, b3, x2, y2, b2 end
-	if y1 > y2 then x1, y1, b1, x2, y2, b2 = x2, y2, b2, x1, y1, b1 end
+	if y1 > y2 then
+		x1, y1, b1, x2, y2, b2 = x2, y2, b2, x1, y1, b1
+	end
+	if y2 > y3 then
+		x2, y2, b2, x3, y3, b3 = x3, y3, b3, x2, y2, b2
+	end
+	if y1 > y2 then
+		x1, y1, b1, x2, y2, b2 = x2, y2, b2, x1, y1, b1
+	end
 
 	local floor, random = math.floor, math.random
 	local yTop = math.max(0, floor(y1))
@@ -121,16 +132,23 @@ local function DitheredTri(x1, y1, x2, y2, x3, y3, colorList, b1, b2, b3)
 			brightness = brightness - brightStep * pxL
 			pxL = 0
 		end
-		if pxR > MAX_X then pxR = MAX_X end
+		if pxR > MAX_X then
+			pxR = MAX_X
+		end
 
 		if pxL <= pxR then
 			local rowBase = y * SCREEN_W
 			for x = pxL, pxR do
 				local b = brightness
-				if b < 0 then b = 0 elseif b > 1 then b = 1 end
+				if b < 0 then
+					b = 0 elseif b > 1 then
+					b = 1
+				end
 				local position = b * segments
 				local segIdx = floor(position)
-				if segIdx >= segments then segIdx = segments - 1 end
+				if segIdx >= segments then
+					segIdx = segments - 1
+				end
 				local intensity = floor((position - segIdx) * 16 + 0.5)
 				local color = (intensity > random(0, 15)) and colorList[segIdx + 2] or colorList[segIdx + 1]
 				poke4(rowBase + x, color)
@@ -141,17 +159,17 @@ local function DitheredTri(x1, y1, x2, y2, x3, y3, colorList, b1, b2, b3)
 end
 
 -- Pyramid: 4 dithered triangle faces meeting at apex.
-local function DrawPyramid(tlX, tlY, trX, trY, blX, blY, brX, brY, apexX, apexY)
-	DitheredTri(tlX, tlY, apexX, apexY, trX, trY, PYRAMID_FACE_RAMPS[1], 0, 1, 0)
-	DitheredTri(trX, trY, apexX, apexY, brX, brY, PYRAMID_FACE_RAMPS[2], 0, 1, 0)
-	DitheredTri(tlX, tlY, apexX, apexY, blX, blY, PYRAMID_FACE_RAMPS[3], 0, 1, 0)
-	DitheredTri(blX, blY, apexX, apexY, brX, brY, PYRAMID_FACE_RAMPS[4], 0, 1, 0)
+local function drawPyramid(tlX, tlY, trX, trY, blX, blY, brX, brY, apexX, apexY)
+	ditheredTri(tlX, tlY, apexX, apexY, trX, trY, PYRAMID_FACE_RAMPS[1], 0, 1, 0)
+	ditheredTri(trX, trY, apexX, apexY, brX, brY, PYRAMID_FACE_RAMPS[2], 0, 1, 0)
+	ditheredTri(tlX, tlY, apexX, apexY, blX, blY, PYRAMID_FACE_RAMPS[3], 0, 1, 0)
+	ditheredTri(blX, blY, apexX, apexY, brX, brY, PYRAMID_FACE_RAMPS[4], 0, 1, 0)
 end
 
 -- Pyramid grid. Builds a (cellCols+1) x (cellRows+1) table of warped corners
 -- so adjacent cells share endpoints exactly (no gaps); outer ring anchored
 -- so the screen border stays covered.
-local function DrawPyramidGrid()
+local function drawPyramidGrid()
 	local t = time()
 	local waveT = t * WAVE_SPEED
 	local sin, cos, min, floor = math.sin, math.cos, math.min, math.floor
@@ -191,13 +209,13 @@ local function DrawPyramidGrid()
 			local angSpeed = (gx * GRID_SPACING + gy * GRID_SPACING + 1) / APEX_SPEED_DIV
 			local apexX = floor(cx + APEX_AMP * sin(t * angSpeed) + 0.5)
 			local apexY = floor(cy + APEX_AMP * cos(t * angSpeed) + 0.5)
-			DrawPyramid(tlX, tlY, trX, trY, blX, blY, brX, brY, apexX, apexY)
+			drawPyramid(tlX, tlY, trX, trY, blX, blY, brX, brY, apexX, apexY)
 		end
 	end
 end
 
 -- Logo blit (drawn last, on top).
-local function DrawLogoOnTop()
+local function drawLogoOnTop()
 	spr(LOGO_FIRST_SPRITE, LOGO_X, LOGO_Y, LOGO_KEY, 1, 0, 0, LOGO_TILES, LOGO_TILES)
 end
 
@@ -207,7 +225,7 @@ end
 -- the resulting fractional offset onto integer pixels by random-dithering
 -- between floor and floor+1 (centroid slides smoothly across the int grid);
 -- darken the underlying screen pixel by 2 or 3 palette steps (50/50 mix).
-local function DrawLogoShadow()
+local function drawLogoShadow()
 	local random, floor = math.random, math.floor
 	local heightT = time() * WAVE_SPEED
 
@@ -243,9 +261,9 @@ end
 
 cls()
 function TIC()
-	DrawPyramidGrid()
-	DrawLogoShadow()
-	DrawLogoOnTop()
+	drawPyramidGrid()
+	drawLogoShadow()
+	drawLogoOnTop()
 end
 
 -- <TILES>
