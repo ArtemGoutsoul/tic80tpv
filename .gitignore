@@ -1,0 +1,13 @@
+# Claude Code session/scratch
+.claude/
+.local/
+.screenshots/
+
+# IDE
+.idea/
+.vscode/
+.mcp.json
+
+# OS junk
+Thumbs.db
+.DS_Store

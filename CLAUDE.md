@@ -53,6 +53,52 @@ TIC-80 needs its own window. Invoking it directly with `&` from a background Pow
 Start-Process -FilePath "C:\dev\tic80\tic80.exe" -ArgumentList "C:\dev\tic80\test2\tpv.lua" -WorkingDirectory "C:\dev\tic80\test2"
 ```
 
+### Screenshot capture (window grab)
+
+For verifying visual changes from an automated session, capture the TIC-80 window via `System.Drawing` + `GetWindowRect`:
+
+```powershell
+Add-Type -AssemblyName System.Drawing
+Add-Type @'
+using System; using System.Runtime.InteropServices;
+public class Win32 {
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
+    [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+}
+'@
+$proc = Get-Process tic80 | ? { $_.MainWindowHandle -ne 0 } | Select -First 1
+[Win32]::ShowWindow($proc.MainWindowHandle, 9) | Out-Null  # SW_RESTORE
+[Win32]::SetForegroundWindow($proc.MainWindowHandle) | Out-Null
+Start-Sleep -Milliseconds 800  # let the window come forward and redraw
+$rect = New-Object Win32+RECT
+[Win32]::GetWindowRect($proc.MainWindowHandle, [ref]$rect) | Out-Null
+$bmp = New-Object System.Drawing.Bitmap(($rect.Right - $rect.Left), ($rect.Bottom - $rect.Top))
+$g = [System.Drawing.Graphics]::FromImage($bmp)
+$g.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $bmp.Size)
+$bmp.Save('.screenshots/<name>.png', [System.Drawing.Imaging.ImageFormat]::Png)
+```
+
+Notes:
+- **Each `PowerShell` tool call has fresh shell state** — `Add-Type` definitions don't persist between calls, so re-declare them in every screenshot script.
+- The screen capture reads whatever pixels are currently on-screen at the window's rect — if the OS lock screen is up, you'll capture the lock screen, not TIC-80.
+- After restarting TIC-80 (`Stop-Process` + `Start-Process`), wait ~3–4 seconds before screenshotting so the cart has time to compile and run; otherwise you'll catch the boot/loading screen.
+
+#### Screenshot folder & cleanup
+
+- Save screenshots to `.screenshots/` in the project root, **not** the project root itself, **not** `.local/`. The folder name is gitignored (see `.gitignore` — create one with `.screenshots/` and `.local/` listed if it doesn't exist yet).
+- Use descriptive names that reflect what's being verified (`tic80_shadow_subpixel.png`, `tic80_wavy_irregular.png`) — the folder is a debugging scratchpad, not history we want to preserve.
+- **Clean up old screenshots at the start of a screenshotting session** (anything older than ~1 hour is from a prior session and isn't useful):
+
+```powershell
+Get-ChildItem .screenshots -File -ErrorAction SilentlyContinue |
+  Where-Object LastWriteTime -lt (Get-Date).AddHours(-1) |
+  Remove-Item
+```
+
+Doing this only at session start (not after every screenshot) preserves intra-session comparisons while keeping the folder from growing without bound.
+
 ## TIC-80 Architecture
 
 ### Core Concepts
@@ -99,6 +145,81 @@ This is a **demoscene production** - an audiovisual artistic demo showcasing pro
 - Examples:
   - Good: `scanline`, `wave`, `address`, `color`
   - Avoid: `s`, `w`, `addr`, `col` (except in standard contexts)
+
+## Demoscene Techniques in tpv.lua
+
+These are the non-obvious patterns currently in use in `tpv.lua`. Reach for them when adding new effects.
+
+### Direct screen RAM writes (`poke4`)
+
+The screen is 240×136 at 4 bits/pixel starting at nibble address 0. Writing pixels via `poke4(y * 240 + x, color)` is **substantially faster** than `pix(x, y, color)` because it skips the API-call overhead. Use this in any inner pixel loop.
+
+### Sprite-mask sampling
+
+To read pixel data from sprites (e.g. for shadows, outlines, or per-pixel effects driven by a sprite shape), peek directly into sprite RAM:
+
+- **BG tiles (sprite IDs 0–255)**: byte base `0x4000` → nibble base `0x8000`
+- **FG sprites (sprite IDs 256–511)**: byte base `0x6000` → nibble base `0xC000`
+
+Each sprite is 8×8 pixels at 4 bits each = 64 nibbles. For sprite `id` in the FG range and pixel `(px, py)`:
+
+```lua
+local localId = id - 256
+local nibble  = peek4(0xC000 + localId * 64 + py * 8 + px)
+-- 0 = transparent (typical), otherwise the palette index
+```
+
+This is how `DrawLogoShadow` tests the logo's transparency mask without re-rendering the sprite.
+
+### Dithered gradients (faking >16 colors)
+
+Two complementary patterns are used:
+
+1. **`DrawDitheredGradient(x, y, w, h, colorList)`** (rectangular). Per-row brightness is constant, so the 4-pixel Bayer (or random) pattern is precomputed once per row and the inner loop is just a `poke4`. Cheap enough for full-screen backgrounds.
+2. **`DitheredTri(x1, y1, x2, y2, x3, y3, colorList, b1, b2, b3)`** (arbitrary triangle). Scanline rasterizer: vertices sorted by Y, left/right `x` and `brightness` advanced incrementally along the triangle edges, brightness then steps once per pixel across each scanline. A per-pixel `math.random(0, 15)` threshold picks between the two adjacent stops in `colorList`, producing animated white-noise dither.
+
+`colorList` is an ordered ramp of palette indices from dark to light (e.g. `{4, 9, 14, 15}` = brown → orange → yellow → white). The per-vertex `bN` values in `[0, 1]` map to a position along the ramp.
+
+### Sub-pixel rendering via random dithering
+
+To smoothly slide a single-pixel-thick element (sprite, shadow, particle) between integer screen coordinates, use:
+
+```lua
+local fx = math.floor(targetX)
+local sx = (math.random() < targetX - fx) and (fx + 1) or fx
+```
+
+As `targetX` smoothly crosses 4.0 → 4.5 → 5.0, the proportion of pixels at `fx + 1` grows 0% → 50% → 100%. The visible centroid moves continuously even though every pixel is still on the integer grid. Used by `DrawLogoShadow` so the shadow doesn't snap as its offset changes.
+
+### Wavy mesh via shared-corner table
+
+`DrawPyramidGrid` builds a `(cellCols + 1) × (cellRows + 1)` table of warped corner positions once per frame and looks them up per cell. Adjacent cells share corners exactly (no overlap, no gap), so the grid bends like a sheet of cloth. The outer ring of corners is anchored (`edgeWeight = 0`) so the screen border stays covered. **Snap corners to integer pixels** with `math.floor(x + 0.5)` to avoid sub-pixel rounding artifacts at shared rasterizer edges.
+
+### Coupling effects to one wave function
+
+When two effects should look like they belong to the same world, key them off the **same** wave function. The logo shadow's height field uses the exact `cos(...) * 0.6 + cos(...) * 0.4` formula the grid uses for vertical corner displacement (`dy`), evaluated at the shadow pixel's grid coordinates. The shadow then sways in lockstep with the surface bending below it.
+
+### Per-palette darkening LUT
+
+For a "darken this pixel by one shade" effect (drop shadow, pressed-button highlight, etc.), hand-tune a 16-entry table mapping each palette index to its darker counterpart. Apply twice for a deeper darken. The DB16 mapping in `SHADOW_DARKEN` walks warm colors toward brown and cool colors toward dark blue.
+
+## Lua / TIC-80 Gotchas
+
+- **`local` declarations must precede every function that uses them.** Lua resolves an unknown name as a global (which is `nil`) when the function is *defined*, not when it's *called*. If `local FOO = 0.0042` is declared after a function that references `FOO`, that function gets `nil` at runtime. Put module-level `local` constants near the top of the file before any function definitions.
+- **Forward function references work fine** — Lua looks up function values dynamically when the call happens, so `function A() B() end` followed by `function B() ... end` works. Only `local` *values* hit the ordering trap.
+- **`math.random()` with no args** returns a float in `[0, 1)` (Lua 5.3+). With `(m, n)` returns an integer in `[m, n]`. Both forms advance the same global PRNG state, so per-pixel calls naturally vary frame-to-frame.
+- **Integer division `//` is available** (Lua 5.3+), as are bitwise ops. `tpv.lua` uses `//` freely.
+- **TIC-80 launches as a windowed app**, not a CLI — invoking it via `&` from a non-interactive PowerShell makes it exit immediately. Use `Start-Process` (see "Launching from an automated/non-interactive shell" above).
+
+## Performance budget (rule of thumb)
+
+At 60 FPS on TIC-80 Lua:
+
+- Tens of thousands of `poke4` / `peek4` per frame: fine
+- ~150k pixel-level operations per frame: borderline; profile if you add more
+- Per-pixel `math.sin` / `math.cos`: ~16k–32k per frame is OK; 100k+ will dip below 60 FPS
+- Prefer **scanline rasterization** with incremental brightness over per-pixel **bounding-box + barycentric** for triangle effects
+- Localize `math.floor`, `math.sin`, `math.random`, `pix`/`poke4` etc. inside hot functions (`local floor = math.floor`) to skip repeated table lookups
 
 ---
 
