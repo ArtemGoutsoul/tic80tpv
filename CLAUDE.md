@@ -19,6 +19,11 @@ The project is currently in development (work in progress).
 
 - **snow.lua** - Standalone secondary cart: procedural 6-fold-symmetric snowfall with parallax depth layers, sine-wave drift, and spacebar-triggered wind gusts
 
+- **Music engine** (code-composed soundtrack, split for reuse; see the `music-in-code` skill). The libs are `require`d, so run the carts from the project folder with `--fs` (e.g. `tic80.exe music-tester.lua --fs C:\dev\tic80\test2 --cmd=run`):
+  - **tracker.lua** - Reusable code-synth + sequencer library; loads as a global `Tracker`. No song data, no UI. Edit this to change *how* the music sounds (see the `tic80-sound` skill).
+  - **music01.lua** - The song: instruments, drum loops, and the flat `tune`; calls `Tracker.setSong`. Edit this to change *what* plays. **Versioned** — future iterations are `music02.lua`, etc.; keep old ones for reference, and point the player carts' `require` at the current one.
+  - **music-tester.lua** - Debug player cart: mute switches, part skipping, readout. `require`s tracker + the current music file. `tpv.lua` will consume the same engine and read `Tracker.row()`/`beat()`/part to time visuals.
+
 - **tic80stubs.lua** - TIC-80 API type definitions for Lua LSP (EmmyLua format)
   - Provides autocomplete and type checking for TIC-80 API functions
   - Not part of the actual demo runtime
@@ -32,16 +37,17 @@ The project is currently in development (work in progress).
   - **tic80-api-reference.md** - Indexed TIC-80 API quick reference (moved out of this file); full per-function docs in `tic80wiki/`
 
 - **.claude/skills/** - Task playbooks auto-surfaced by trigger words (local-only; `.claude/` is gitignored):
-  - **tic80-sound** - Making sound/music in TIC-80 from Lua (API, instrument RAM, raw sound registers)
+  - **tic80-sound** - How TIC-80 sound works + the register-level synth engine reference (API, instrument RAM, raw sound registers, filter/voices). Use when editing the synth engine.
+  - **music-in-code** - Composing the soundtrack in `music.lua` with the `tracker.lua` engine (tune rows/cells, instruments, drum loops, parts) and driving a demo off the music clock. Use when writing music.
   - **tic80-screenshot** - Screenshotting the running TIC-80 window to verify visual changes from an automated session
 
 ## TIC-80 Development Commands
 
 The TIC-80 executable lives one directory up from this project: `C:\dev\tic80\tic80.exe` (it is **not** on PATH).
 
-To run the demo:
+To run the demo (now needs `--fs` because it `require`s the music engine):
 ```
-C:\dev\tic80\tic80.exe tpv.lua
+C:\dev\tic80\tic80.exe tpv.lua --fs C:\dev\tic80\test2 --cmd=run
 ```
 
 Or load in TIC-80 console:
@@ -60,7 +66,7 @@ C:\dev\tic80\tic80.exe october.tic
 TIC-80 needs its own window. Invoking it directly with `&` from a background PowerShell task causes it to load the cart and exit immediately (no TTY). Use `Start-Process` so it launches detached:
 
 ```powershell
-Start-Process -FilePath "C:\dev\tic80\tic80.exe" -ArgumentList "C:\dev\tic80\test2\tpv.lua" -WorkingDirectory "C:\dev\tic80\test2"
+Start-Process -FilePath "C:\dev\tic80\tic80.exe" -ArgumentList "C:\dev\tic80\test2\tpv.lua --fs C:\dev\tic80\test2 --cmd=run" -WorkingDirectory "C:\dev\tic80\test2"
 ```
 
 ### Screenshot capture (window grab)
