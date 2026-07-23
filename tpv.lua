@@ -3,55 +3,156 @@
 -- desc:    A Douglas Adams inspired TIC-80 demoscene demo
 -- site:    https://github.com/ArtemGoutsoul/tic80tpv
 -- license: MIT License
--- version: 0.1
+-- version: 0.2
 -- script:  lua
 
 -- Theme background: see docs/total-perspective-vortex.md for a summary of
 -- Douglas Adams' Hitchhiker's Guide works and the Total Perspective Vortex.
 
+-- Music engine (soundtrack + a timing source for keyframing visuals; see the
+-- music-in-code skill). The required libs mean this cart must launch with --fs:
+--   tic80.exe tpv.lua --fs C:\dev\tic80\test2 --cmd=run
+package.path = package.path .. ";C:/dev/tic80/test2/?.lua"
+require "tracker"
+require "music01"
+
+-- =========================================================================
+-- TITLE REVEAL. Every non-transparent logo pixel is one particle that knows
+-- its final home (radius + angle from the logo centre) and its colour. The
+-- reveal plays in three stages:
+--
+--   IMPLODE   the logo starts zoomed ~4x (bigger than the screen); a ray is
+--             drawn from every pixel straight to the centre, then the rays'
+--             outer ends retract into a single bright dot in the middle.
+--   DOT HOLD  a short beat on the bright singularity.
+--   EXPLODE   the dot blooms back out. A sine-shaped zoom (_.-'``') swells it
+--             past 100% to a 150% overshoot then settles, while a vortex swirl
+--             untwists to zero -- every particle spirals home onto its true
+--             logo pixel and the title snaps into focus.
+--
+-- The swirl is the *trajectory* (angle offset proportional to radius -> a
+-- logarithmic spiral that untwists); the particles are the *representation*
+-- (single dithered pixels). No offscreen buffer -- swirl and convergence are
+-- the same formula. Colours always come from the logo bitmap.
+-- =========================================================================
+
 -- Screen
 local SCREEN_W, SCREEN_H = 240, 136
 local MAX_X, MAX_Y = SCREEN_W - 1, SCREEN_H - 1
 
--- Pyramid grid
-local GRID_SPACING = 28                 -- pyramids tile flush to this grid, no gaps
-local APEX_AMP = 12                     -- per-cell apex orbit radius (px)
-local APEX_SPEED_DIV = 10000            -- larger = slower apex orbit
-
-local PYRAMID_FACE_RAMPS = {            -- dark base → white at apex
-	{2,  8, 13, 15},  -- front: dark blue → light blue → cyan → white
-	{3, 10, 15},      -- right: gray → light gray → white
-	{4,  9, 14, 15},  -- left:  brown → orange → yellow → white
-	{5, 11, 14, 15},  -- back:  green → light green → yellow → white
-}
-
--- Wave (drives both grid corner displacement and the shadow's height field)
-local WAVE_AMP = 7
-local WAVE_SPEED = 0.0042
-
--- Two-harmonic 2D waves at incommensurate ratios — the result doesn't look
--- periodic over short timescales. waveY is reused as the shadow's depth proxy
--- so the shadow stays in phase with the bending grid below.
-local function waveX(gxF, gyF, t)
-	return math.sin(t        + gxF * 0.45 + gyF * 0.6) * 0.6
-	+ math.sin(t * 1.73 + gxF * 0.9  + gyF * 0.3) * 0.4
-end
-
-local function waveY(gxF, gyF, t)
-	return math.cos(t * 1.1  + gxF * 0.7 + gyF * 0.4) * 0.6
-	+ math.cos(t * 0.83 + gxF * 0.4 + gyF * 0.8) * 0.4
-end
-
--- Logo
+-- Logo (128x128 built from 16x16 FG sprite tiles starting at sprite 256)
 local LOGO_FIRST_SPRITE = 256
-local LOGO_TILES = 16                   -- 16x16 sprite tiles = 128px square
+local LOGO_TILES = 16
 local LOGO_PIXELS = LOGO_TILES * 8
 local LOGO_X = (SCREEN_W - LOGO_PIXELS) // 2
 local LOGO_Y = (SCREEN_H - LOGO_PIXELS) // 2
 local LOGO_KEY = 0                      -- transparent palette index
+local CENTER_X = LOGO_X + LOGO_PIXELS // 2
+local CENTER_Y = LOGO_Y + LOGO_PIXELS // 2
 
 -- FG sprite RAM at byte 0x6000 = nibble 0xC000; 64 nibbles per 8x8 sprite.
 local FG_SPRITE_NIBBLES = 0xC000
+
+-- Reveal timeline (seconds). Plays once; ~10s total.
+local IMPLODE_DURATION = 2.0              -- rays retract into the dot (equal speed)
+local DOT_HOLD = 0.3                      -- a beat on the bright singularity
+local EXPLODE_DURATION = 6.0              -- dot blooms back out into the logo
+local REVEAL_DURATION = IMPLODE_DURATION + DOT_HOLD + EXPLODE_DURATION
+
+-- Implosion: picture the logo zoomed this many times (way bigger than the
+-- screen); a ray is drawn from each pixel straight to the centre, and every
+-- ray's outer end retracts inward at the SAME speed. Each ray starts dark and
+-- brightens to its pixel's true colour as its tip reaches the centre.
+--   RAY_START_SCALE  how far out (x logo size) the rays begin
+--   RAY_DRAW_MAX     clamp on drawn ray length so off-screen lines stay cheap
+--   RAY_DARK_NEAR    shades darker at the centre end (~50% darker)
+--   RAY_DARK_FAR     shades darker at the far (dim) end
+--   RAY_STRIDE       draw every Nth pixel's ray (perf)
+local RAY_START_SCALE = 20.0
+local RAY_DRAW_MAX = 200
+local RAY_DARK_NEAR = 2
+local RAY_DARK_FAR = 4
+local RAY_STRIDE = 2
+
+-- Explosion zoom, sine-shaped (_.-'``'): a smooth S-rise from the dot up to a
+-- PEAK_SCALE overshoot (reached at PEAK_Q of the explosion), then a gentle sine
+-- settle back to 1.0 (the true logo size).
+local PEAK_Q = 0.60
+local PEAK_SCALE = 1.5
+local EXPLODE_POWER = 4.0                 -- explosion punch: higher = faster initial burst
+
+-- Explosion blast: the same rays fired outward the instant the dot explodes,
+-- drawn underneath the swirling logo. One shade darker than the logo (brighter
+-- than the incoming rays, but never brighter than the logo). They shoot out and
+-- off-screen fast while the logo swirls into shape on top.
+local BLAST_DURATION = 1.0                -- window (s) during which blast rays are drawn
+local BLAST_SPEED_MIN = 450               -- per-ray outward speed range (px/sec)
+local BLAST_SPEED_MAX = 950
+local BLAST_MAX_DELAY = 0.18              -- rays launch staggered over this window (s)
+local BLAST_TAIL_MIN = 40                 -- per-ray streak length range (px)
+local BLAST_TAIL_MAX = 150
+local BLAST_MAX_RADIUS = 190              -- stop drawing a ray once its inner end passes this
+local BLAST_DARK = 1                      -- shade steps darker than the logo
+local BLAST_STRIDE = 2                    -- draw every Nth ray (perf)
+
+-- Vortex / particle shaping (explosion stage only)
+local MAX_TWIST = 8.0                      -- radians of swirl at R_REF when q = 0
+local SPIN_TOTAL = 5.0                     -- whole-field rotation, unwinds to 0
+local R_REF = 64                           -- reference radius (logo half-size)
+local JITTER_MAX = 0.6                     -- per-particle angular chaos at start
+local PARTICLE_STRIDE = 1                  -- keep every Nth opaque pixel (perf)
+
+-- Resolved idle: a darker copy of the logo keeps rotating and slowly zooming in
+-- underneath the fixed crisp logo, so the title stays alive.
+local ECHO_SPIN_SPEED = -1.0              -- rad/sec; ~matches the swirl's spin as it settles
+local ECHO_ZOOM_SPEED = 0.7               -- scale gained per second (zoom in)
+local ECHO_DARK_STEPS = 2                 -- shade steps darker than the logo
+local ECHO_LEAD = 0.5                     -- start the echo this early so the handoff has no dead beat
+
+-- Trails: instead of clearing, darken the whole framebuffer one shade per
+-- frame so moving particles leave fading comet tails -- sells the vortex.
+local TRAILS = true
+
+-- One-shade-darker LUT (DB16-tuned: warm -> brown, cool -> dark blue, all
+-- chains terminate at 0). Repeated application fades any pixel to black.
+local FADE = {
+	[0] = 0,  [1] = 0, [2] = 0, [3] = 1,
+	[4] = 1,  [5] = 1, [6] = 4, [7] = 1,
+	[8] = 2,  [9] = 4, [10] = 3, [11] = 5,
+	[12] = 7, [13] = 8, [14] = 9, [15] = 10,
+}
+
+local DEBUG = true                       -- frametime / fps / particle count HUD
+local LOOP = false                       -- play once (set true to auto-replay while iterating)
+local RESOLVED_HOLD = 2.0                 -- debug: seconds to hold the logo before looping
+
+-- Particle table (parallel arrays for speed), built once from the logo mask.
+local particleR = {}                     -- final radius from logo center
+local particleAngle = {}                 -- final angle from logo center
+local particleColor = {}                 -- palette index of the logo pixel
+local particleColorDark = {}             -- darkened colour for the idle echo
+local particleColorBlast = {}            -- colour for the explosion blast rays
+local particleBlastSpeed = {}            -- per-ray outward speed (px/sec)
+local particleBlastDelay = {}            -- per-ray launch delay (s)
+local particleBlastLen = {}              -- per-ray streak length (px)
+local particleJitter = {}                -- per-particle [-1,1] chaos seed
+local particleCount = 0
+local maxParticleR = 0                    -- largest rest radius (equal-speed rays)
+
+-- Explosion zoom curve, sine-shaped (_.-'``'): an S-rise from 0 up to
+-- PEAK_SCALE by q = PEAK_Q, then a sine settle from PEAK_SCALE back to 1.0 by
+-- q = 1. Velocity is zero at the peak, giving the little plateau at the top.
+local function sineZoom(q)
+	local pi, cos = math.pi, math.cos
+	if q <= PEAK_Q then
+		-- Ease-out burst: high initial velocity, heavy deceleration into the
+		-- peak (derivative 0 at u = 1, so the top still plateaus smoothly).
+		local u = q / PEAK_Q
+		return PEAK_SCALE * (1 - (1 - u) ^ EXPLODE_POWER)
+	end
+	local u = (q - PEAK_Q) / (1 - PEAK_Q)
+	return 1.0 + (PEAK_SCALE - 1.0) * (0.5 + 0.5 * cos(pi * u))
+end
 
 -- Nibble address of pixel (lx, ly) inside the logo's 128x128 sprite mask.
 local function logoMaskAddr(lx, ly)
@@ -59,211 +160,231 @@ local function logoMaskAddr(lx, ly)
 	return FG_SPRITE_NIBBLES + sprite * 64 + (ly % 8) * 8 + (lx % 8)
 end
 
--- Logo shadow
-local SHADOW_OFFSET_X = 4
-local SHADOW_OFFSET_Y = 4
-local SHADOW_DEPTH = 0.4                -- how strongly height pulls the offset
-
--- Per-palette-index "one shade darker" lookup, hand-tuned for DB16: warm
--- colors fall toward brown, cool toward dark blue, dark indices saturate at 0.
-local SHADOW_DARKEN = {
-	[0] = 0,  [1] = 0, [2] = 0, [3] = 1,
-	[4] = 1,  [5] = 1, [6] = 4, [7] = 1,
-	[8] = 2,  [9] = 4, [10] = 3, [11] = 5,
-	[12] = 7,  [13] = 8, [14] = 9, [15] = 10,
-}
-
--- Scanline triangle filled with a dithered gradient through colorList.
--- Per-vertex brightness (b1..b3, in 0..1) is interpolated; a per-pixel random
--- threshold picks between the two adjacent ramp stops.
-local function ditheredTri(x1, y1, x2, y2, x3, y3, colorList, b1, b2, b3)
-	local segments = #colorList - 1
-	if segments < 1 then
-		return
-	end
-
-	if y1 > y2 then
-		x1, y1, b1, x2, y2, b2 = x2, y2, b2, x1, y1, b1
-	end
-	if y2 > y3 then
-		x2, y2, b2, x3, y3, b3 = x3, y3, b3, x2, y2, b2
-	end
-	if y1 > y2 then
-		x1, y1, b1, x2, y2, b2 = x2, y2, b2, x1, y1, b1
-	end
-
-	local floor, random = math.floor, math.random
-	local yTop = math.max(0, floor(y1))
-	local yBot = math.min(MAX_Y, floor(y3))
-
-	local dy13, dy12, dy23 = y3 - y1, y2 - y1, y3 - y2
-	local mx13 = (dy13 ~= 0) and (x3 - x1) / dy13 or 0
-	local mb13 = (dy13 ~= 0) and (b3 - b1) / dy13 or 0
-	local mx12 = (dy12 ~= 0) and (x2 - x1) / dy12 or 0
-	local mb12 = (dy12 ~= 0) and (b2 - b1) / dy12 or 0
-	local mx23 = (dy23 ~= 0) and (x3 - x2) / dy23 or 0
-	local mb23 = (dy23 ~= 0) and (b3 - b2) / dy23 or 0
-
-	for y = yTop, yBot do
-		local dy = y - y1
-		-- Long edge spans the full height; short edge swaps at the middle vertex.
-		local xLong, bLong = x1 + mx13 * dy, b1 + mb13 * dy
-		local xShort, bShort
-		if y < y2 then
-			xShort, bShort = x1 + mx12 * dy, b1 + mb12 * dy
-		else
-			local dy2 = y - y2
-			xShort, bShort = x2 + mx23 * dy2, b2 + mb23 * dy2
-		end
-
-		local xL, xR, bL, bR
-		if xLong <= xShort then
-			xL, xR, bL, bR = xLong, xShort, bLong, bShort
-		else
-			xL, xR, bL, bR = xShort, xLong, bShort, bLong
-		end
-
-		local pxL, pxR = floor(xL), floor(xR)
-		local span = pxR - pxL
-		local brightStep = (span > 0) and (bR - bL) / span or 0
-		local brightness = bL
-
-		if pxL < 0 then
-			brightness = brightness - brightStep * pxL
-			pxL = 0
-		end
-		if pxR > MAX_X then
-			pxR = MAX_X
-		end
-
-		if pxL <= pxR then
-			local rowBase = y * SCREEN_W
-			for x = pxL, pxR do
-				local b = brightness
-				if b < 0 then
-					b = 0 elseif b > 1 then
-					b = 1
+-- Scan the logo mask; each non-transparent pixel becomes a particle whose
+-- resting place (radius, angle, color) is stored relative to the logo center.
+local function buildParticles()
+	local random, sqrt, atan = math.random, math.sqrt, math.atan
+	local count, opaque, maxR = 0, 0, 0
+	for ly = 0, LOGO_PIXELS - 1 do
+		for lx = 0, LOGO_PIXELS - 1 do
+			local color = peek4(logoMaskAddr(lx, ly))
+			if color ~= LOGO_KEY then
+				opaque = opaque + 1
+				if opaque % PARTICLE_STRIDE == 0 then
+					count = count + 1
+					local rx = (LOGO_X + lx) - CENTER_X
+					local ry = (LOGO_Y + ly) - CENTER_Y
+					local rr = sqrt(rx * rx + ry * ry)
+					particleR[count] = rr
+					particleAngle[count] = atan(ry, rx)
+					particleColor[count] = color
+					local dark = color
+					for _ = 1, ECHO_DARK_STEPS do
+						dark = FADE[dark]
+					end
+					particleColorDark[count] = dark
+					local blast = color
+					for _ = 1, BLAST_DARK do
+						blast = FADE[blast]
+					end
+					particleColorBlast[count] = blast
+					particleBlastSpeed[count] = BLAST_SPEED_MIN + random() * (BLAST_SPEED_MAX - BLAST_SPEED_MIN)
+					particleBlastDelay[count] = random() * BLAST_MAX_DELAY
+					particleBlastLen[count] = BLAST_TAIL_MIN + random() * (BLAST_TAIL_MAX - BLAST_TAIL_MIN)
+					particleJitter[count] = random() * 2 - 1
+					if rr > maxR then maxR = rr end
 				end
-				local position = b * segments
-				local segIdx = floor(position)
-				if segIdx >= segments then
-					segIdx = segments - 1
-				end
-				local intensity = floor((position - segIdx) * 16 + 0.5)
-				local color = (intensity > random(0, 15)) and colorList[segIdx + 2] or colorList[segIdx + 1]
-				poke4(rowBase + x, color)
-				brightness = brightness + brightStep
+			end
+		end
+	end
+	particleCount = count
+	maxParticleR = maxR
+end
+
+-- Darken every framebuffer pixel one shade (the trail feedback pass).
+local function fadeScreen()
+	local peek, poke, fade = peek4, poke4, FADE
+	for addr = 0, SCREEN_W * SCREEN_H - 1 do
+		poke(addr, fade[peek(addr)])
+	end
+end
+
+-- The bright, pulsing seed the whole reveal blooms from.
+local function drawSeed(elapsed)
+	local pulse = 0.5 + 0.5 * math.sin(elapsed * 10)
+	local arm = (pulse > 0.66) and 15 or ((pulse > 0.33) and 13 or 12)
+	local base = CENTER_Y * SCREEN_W + CENTER_X
+	poke4(base, 15)
+	poke4(base - 1, arm)
+	poke4(base + 1, arm)
+	poke4(base - SCREEN_W, arm)
+	poke4(base + SCREEN_W, arm)
+end
+
+-- Draw the whole particle field for one frame. radiusScale scales every
+-- particle's rest radius; swirl adds an angle proportional to radius (the
+-- vortex); spin rotates the whole field; jitterAmount adds per-particle
+-- angular chaos. Colours always come from the logo bitmap.
+local function drawField(radiusScale, swirl, spin, jitterAmount, colors)
+	local sin, cos, floor, random = math.sin, math.cos, math.floor, math.random
+	local invRef = 1 / R_REF
+	local pr, pa, pj = particleR, particleAngle, particleJitter
+	local pc = colors or particleColor
+
+	for i = 1, particleCount do
+		local r = pr[i]
+		local angle = pa[i] + spin + swirl * (r * invRef) + pj[i] * jitterAmount
+		local radius = r * radiusScale
+		local x = CENTER_X + radius * cos(angle)
+		local y = CENTER_Y + radius * sin(angle)
+
+		-- Sub-pixel dither: slide the centroid smoothly across the int grid.
+		local fx, fy = floor(x), floor(y)
+		local sx = (random() < x - fx) and (fx + 1) or fx
+		local sy = (random() < y - fy) and (fy + 1) or fy
+
+		if sx >= 0 and sx <= MAX_X and sy >= 0 and sy <= MAX_Y then
+			poke4(sy * SCREEN_W + sx, pc[i])
+		end
+	end
+end
+
+-- Implosion (q in 0..1): the logo starts zoomed RAY_START_SCALE times; a ray is
+-- drawn from every pixel straight to the centre, so the screen fills with
+-- colour rays converging on one dot. Every ray's tip retracts inward at the
+-- SAME speed (the longest just reaches the centre at q = 1); a ray starts dark
+-- and brightens to its pixel's true colour as its tip nears the centre.
+local function drawImplode(q)
+	local cos, sin, floor = math.cos, math.sin, math.floor
+	local cx, cy = CENTER_X, CENTER_Y
+	local pr, pa, pc, pj = particleR, particleAngle, particleColor, particleJitter
+	local fade = FADE
+	local s0 = RAY_START_SCALE
+	local maxTip = maxParticleR * s0
+	local retract = maxTip * q                   -- equal-speed inward travel
+	local invMaxTip = 1 / maxTip
+	local drawMax = RAY_DRAW_MAX
+	local near, far = RAY_DARK_NEAR, RAY_DARK_FAR
+
+	for i = 1, particleCount, RAY_STRIDE do
+		local tip = pr[i] * s0 - retract
+		if tip < 0 then tip = 0 end
+		-- Darkest at the far tip, ~50% darker (RAY_DARK_NEAR) at the centre end.
+		-- The per-ray dither term spreads the shade steps so it reads as smooth.
+		local steps = floor(near + tip * invMaxTip * (far - near) + (pj[i] * 0.5 + 0.5))
+		local color = pc[i]
+		for _ = 1, steps do
+			color = fade[color]
+		end
+		local drawR = (tip > drawMax) and drawMax or tip
+		local ang = pa[i]
+		line(cx + drawR * cos(ang), cy + drawR * sin(ang), cx, cy, color)
+	end
+end
+
+-- Explosion (q in 0..1): the dot blooms back out. Sine zoom for size; swirl,
+-- spin and jitter all unwind to zero as q -> 1, so the vortex untwists exactly
+-- as the logo reaches full size.
+local function drawExplode(q)
+	drawField(sineZoom(q), MAX_TWIST * (1 - q), SPIN_TOTAL * (1 - q), JITTER_MAX * (1 - q))
+end
+
+-- Explosion blast (et = seconds into the explosion): the same rays fired
+-- outward the instant the dot explodes. Each ray has its own launch delay,
+-- speed and length (randomised at build time), so the burst looks ragged rather
+-- than a uniform ring. A ray is a streak inner..outer travelling out; once its
+-- inner end passes the screen it is skipped. Drawn underneath the swirling logo,
+-- a shade brighter than the incoming rays but never brighter than the logo.
+local function drawBlast(et)
+	local cos, sin = math.cos, math.sin
+	local cx, cy = CENTER_X, CENTER_Y
+	local pa, pcb = particleAngle, particleColorBlast
+	local bs, bd, bl = particleBlastSpeed, particleBlastDelay, particleBlastLen
+	local maxRadius = BLAST_MAX_RADIUS
+	for i = 1, particleCount, BLAST_STRIDE do
+		local age = et - bd[i]
+		if age > 0 then
+			local outer = bs[i] * age
+			local inner = outer - bl[i]
+			if inner < 0 then inner = 0 end
+			if inner < maxRadius then
+				local ang = pa[i]
+				local ca, sa = cos(ang), sin(ang)
+				line(cx + inner * ca, cy + inner * sa, cx + outer * ca, cy + outer * sa, pcb[i])
 			end
 		end
 	end
 end
 
--- Pyramid: 4 dithered triangle faces meeting at apex.
-local function drawPyramid(tlX, tlY, trX, trY, blX, blY, brX, brY, apexX, apexY)
-	ditheredTri(tlX, tlY, apexX, apexY, trX, trY, PYRAMID_FACE_RAMPS[1], 0, 1, 0)
-	ditheredTri(trX, trY, apexX, apexY, brX, brY, PYRAMID_FACE_RAMPS[2], 0, 1, 0)
-	ditheredTri(tlX, tlY, apexX, apexY, blX, blY, PYRAMID_FACE_RAMPS[3], 0, 1, 0)
-	ditheredTri(blX, blY, apexX, apexY, brX, brY, PYRAMID_FACE_RAMPS[4], 0, 1, 0)
+-- Resolved idle echo: the same particle logo, darker, rotated and scaled up,
+-- drawn underneath the crisp logo so the title keeps moving.
+local function drawEcho(angleOffset, radiusScale)
+	drawField(radiusScale, 0, angleOffset, 0, particleColorDark)
 end
 
--- Pyramid grid. Builds a (cellCols+1) x (cellRows+1) table of warped corners
--- so adjacent cells share endpoints exactly (no gaps); outer ring anchored
--- so the screen border stays covered.
-local function drawPyramidGrid()
-	local t = time()
-	local waveT = t * WAVE_SPEED
-	local sin, cos, min, floor = math.sin, math.cos, math.min, math.floor
-	local cellCols = (SCREEN_W // GRID_SPACING) + 1
-	local cellRows = (SCREEN_H // GRID_SPACING) + 1
-
-	local cornerX, cornerY = {}, {}
-	for gy = 0, cellRows do
-		local rowX, rowY = {}, {}
-		local edgeY = min(gy, cellRows - gy)
-		local y0 = gy * GRID_SPACING
-		for gx = 0, cellCols do
-			local edgeX = min(gx, cellCols - gx)
-			local edgeWeight = min(edgeX, edgeY, 1)  -- 0 at outer ring, 1 inside
-			local x0 = gx * GRID_SPACING
-			local dx = WAVE_AMP * waveX(gx, gy, waveT) * edgeWeight
-			local dy = WAVE_AMP * waveY(gx, gy, waveT) * edgeWeight
-			-- Snap to int → no sub-pixel seams between adjacent triangles
-			rowX[gx] = floor(x0 + dx + 0.5)
-			rowY[gx] = floor(y0 + dy + 0.5)
-		end
-		cornerX[gy] = rowX
-		cornerY[gy] = rowY
-	end
-
-	for gy = 0, cellRows - 1 do
-		local rX0, rX1 = cornerX[gy], cornerX[gy + 1]
-		local rY0, rY1 = cornerY[gy], cornerY[gy + 1]
-		for gx = 0, cellCols - 1 do
-			local tlX, tlY = rX0[gx],     rY0[gx]
-			local trX, trY = rX0[gx + 1], rY0[gx + 1]
-			local blX, blY = rX1[gx],     rY1[gx]
-			local brX, brY = rX1[gx + 1], rY1[gx + 1]
-
-			local cx = (tlX + trX + blX + brX) * 0.25
-			local cy = (tlY + trY + blY + brY) * 0.25
-			local angSpeed = (gx * GRID_SPACING + gy * GRID_SPACING + 1) / APEX_SPEED_DIV
-			local apexX = floor(cx + APEX_AMP * sin(t * angSpeed) + 0.5)
-			local apexY = floor(cy + APEX_AMP * cos(t * angSpeed) + 0.5)
-			drawPyramid(tlX, tlY, trX, trY, blX, blY, brX, brY, apexX, apexY)
-		end
-	end
-end
-
--- Logo blit (drawn last, on top).
+-- Crisp logo blit for the resolved state.
 local function drawLogoOnTop()
 	spr(LOGO_FIRST_SPRITE, LOGO_X, LOGO_Y, LOGO_KEY, 1, 0, 0, LOGO_TILES, LOGO_TILES)
 end
 
--- Logo drop shadow with sub-pixel-smooth, depth-modulated offset.
--- Per non-transparent logo pixel: scale the shadow offset by the underlying
--- waveY height (so the shadow tracks the bending pyramid grid below); place
--- the resulting fractional offset onto integer pixels by random-dithering
--- between floor and floor+1 (centroid slides smoothly across the int grid);
--- darken the underlying screen pixel by 2 or 3 palette steps (50/50 mix).
-local function drawLogoShadow()
-	local random, floor = math.random, math.floor
-	local heightT = time() * WAVE_SPEED
-
-	for ly = 0, LOGO_PIXELS - 1 do
-		local logoSy = LOGO_Y + ly
-		for lx = 0, LOGO_PIXELS - 1 do
-			if peek4(logoMaskAddr(lx, ly)) ~= LOGO_KEY then
-				local logoSx = LOGO_X + lx
-				local sampleX = logoSx + SHADOW_OFFSET_X
-				local sampleY = logoSy + SHADOW_OFFSET_Y
-				local heightAt = waveY(sampleX / GRID_SPACING, sampleY / GRID_SPACING, heightT)
-				local distFactor = 1 - heightAt * SHADOW_DEPTH
-
-				local shadowFx = logoSx + SHADOW_OFFSET_X * distFactor
-				local shadowFy = logoSy + SHADOW_OFFSET_Y * distFactor
-				local fx, fy = floor(shadowFx), floor(shadowFy)
-				local sx = (random() < shadowFx - fx) and (fx + 1) or fx
-				local sy = (random() < shadowFy - fy) and (fy + 1) or fy
-
-				if sx >= 0 and sx <= MAX_X and sy >= 0 and sy <= MAX_Y then
-					local addr = sy * SCREEN_W + sx
-					local twice = SHADOW_DARKEN[SHADOW_DARKEN[peek4(addr)]]
-					if random(0, 1) == 0 then
-						poke4(addr, SHADOW_DARKEN[twice])  -- triple
-					else
-						poke4(addr, twice)
-					end
-				end
-			end
-		end
-	end
+local debugLastMs = 0
+local function drawDebug(elapsed)
+	local now = time()
+	local dt = now - debugLastMs
+	debugLastMs = now
+	local fps = (dt > 0) and (1000 / dt) or 0
+	print(string.format("%.1fms  %.0ffps", dt, fps), 2, 2, 12, false, 1, true)
+	print(string.format("particles:%d  t:%.1f", particleCount, elapsed), 2, 9, 12, false, 1, true)
 end
 
-cls()
+-- time() base so the reveal can be replayed (press A / Z) while iterating.
+local timeBaseMs = 0
+
+cls(0)
 function TIC()
-	drawPyramidGrid()
-	drawLogoShadow()
-	drawLogoOnTop()
+	Tracker.update()          -- advance + play the soundtrack
+
+	if particleCount == 0 then
+		buildParticles()
+	end
+	if btnp(4) then
+		timeBaseMs = time()   -- replay the reveal (gamepad A / Z)
+	end
+
+	local t = (time() - timeBaseMs) / 1000
+
+	if t < REVEAL_DURATION then
+		if t < IMPLODE_DURATION then
+			cls(0)                                                  -- crisp rays
+			drawImplode(t / IMPLODE_DURATION)
+		elseif t < IMPLODE_DURATION + DOT_HOLD then
+			cls(0)
+			drawSeed(t)                                             -- the singularity
+		else
+			if TRAILS then fadeScreen() else cls(0) end             -- swirl trails
+			local et = t - IMPLODE_DURATION - DOT_HOLD              -- seconds into the explosion
+			if et < BLAST_DURATION then
+				drawBlast(et)                                      -- blast rays underneath
+			end
+			drawExplode(et / EXPLODE_DURATION)                     -- swirling logo on top
+		end
+	else
+		-- Resolved: a darker copy of the logo keeps rotating and zooming in
+		-- underneath, with the crisp logo fixed on top. Spin gets a lead-in so
+		-- the echo is already turned out of hiding at the handoff (no dead beat);
+		-- zoom starts at 1.0 so the shadow doesn't pop in already enlarged.
+		cls(0)
+		local sinceResolve = t - REVEAL_DURATION
+		drawEcho(ECHO_SPIN_SPEED * (sinceResolve + ECHO_LEAD), 1 + ECHO_ZOOM_SPEED * sinceResolve)
+		drawLogoOnTop()
+		if LOOP and sinceResolve > RESOLVED_HOLD then
+			timeBaseMs = time()
+		end
+	end
+
+	if DEBUG then
+		drawDebug(t)
+	end
 end
 
 -- <TILES>
@@ -416,4 +537,3 @@ end
 -- <PALETTE>
 -- 000:140c1c44243430346d4e4a4e854c30346524d04648757161597dced27d2c8595a16daa2cd2aa996dc2cadad45ededed6
 -- </PALETTE>
-
